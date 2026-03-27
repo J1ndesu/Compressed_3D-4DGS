@@ -16,6 +16,7 @@ from .diff_gaussian_rasterization import GaussianRasterizationSettings, Gaussian
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh, eval_shfs_4d
 from collections import defaultdict
+from utils.compression_utils import get_ste_mask
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
@@ -63,6 +64,17 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means2D = screenspace_points
     opacity = pc.get_opacity
 
+    if hasattr(pc, "dynamic_mask_logit") and getattr(pc, "dynamic_mask_logit") is not None:
+        dm_raw = pc.dynamic_mask_logit
+        if dm_raw.numel() == 0 or dm_raw.shape[0] != means3D.shape[0]:
+            dm = torch.ones((means3D.shape[0], 1), device=opacity.device, dtype=opacity.dtype)
+        else:
+            dm = get_ste_mask(dm_raw)
+            if dm.dim() == 1:
+                dm = dm.unsqueeze(1)
+            dm = dm.to(opacity.dtype).to(opacity.device)
+
+        opacity = opacity * dm
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
     scales = None
@@ -82,6 +94,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             opacity = opacity * marginal_t
     else:
         scales = pc.get_scaling
+       
         rotations = pc.get_rotation
         if pc.gaussian_dim == 4:
             scales_t = pc.get_scaling_t
@@ -157,7 +170,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     opacity_static = pc.get_static_opacity
     sh_static = pc.get_static_features
     scales_static = pc.get_static_scaling
-    rotations_static = pc.get_static_rotation 
+    rotations_static = pc.get_static_rotation
+
+    if hasattr(pc, "static_mask_logit") and getattr(pc, "static_mask_logit") is not None:
+        sm_raw = pc.static_mask_logit
+        if sm_raw.numel() == 0 or sm_raw.shape[0] != means3D_static.shape[0]:
+            sm = torch.ones((means3D_static.shape[0], 1), device=opacity_static.device, dtype=opacity_static.dtype)
+        else:
+            sm = get_ste_mask(sm_raw)
+            if sm.dim() == 1:
+                sm = sm.unsqueeze(1)
+            sm = sm.to(opacity_static.dtype).to(opacity_static.device)
+
+        opacity_static = opacity_static * sm
 
     rendered_image, radii, depth, alpha, flow, covs_com, radii_static, color_4d, color_3d, invdepth = rasterizer(
         means3D = means3D,

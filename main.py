@@ -12,6 +12,7 @@
 import os
 import random
 import torch
+import lpips
 from torch import nn
 from utils.loss_utils import l1_loss, ssim, msssim
 from gaussian_renderer import render
@@ -42,7 +43,8 @@ def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4
                num_pts, num_pts_ratio):
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-    
+    lpips_fn = lpips.LPIPS(net='alex').cuda().eval()
+
     gaussians = GaussianModel(dataset.sh_degree, gaussian_dim=gaussian_dim, time_duration=time_duration, 
                               rot_4d=rot_4d, force_sh_3d=force_sh_3d, sh_degree_t=2 if pipe.eval_shfs_4d else 0)
     
@@ -53,14 +55,147 @@ def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4
     train_dir = os.path.join(dataset.model_path, 'train', "ours_{}".format(first_iter))
     test_dir = os.path.join(dataset.model_path, 'test', "ours_{}".format(first_iter))
     gaussians.restore(model_params, None)
+
+    # ---------------- Phi Distribution ----------------
+    print("\n================ Phi Distribution ================\n")
+    thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+    if hasattr(gaussians, "dynamic_mask_logit") and gaussians.dynamic_mask_logit is not None and gaussians.dynamic_mask_logit.numel() > 0:
+        phi_dyn = torch.sigmoid(gaussians.dynamic_mask_logit.detach()).view(-1).cpu()
+        print("Total dynamic gaussians:", phi_dyn.shape[0])
+        print("dynamic phi min :", phi_dyn.min().item())
+        print("dynamic phi max :", phi_dyn.max().item())
+        print("dynamic phi mean:", phi_dyn.mean().item())
+        print("dynamic phi std :", phi_dyn.std().item())
+
+        print("\nRatio below thresholds:")
+        for t in thresholds:
+            ratio = (phi_dyn < t).float().mean().item()
+            print(f"phi_dyn < {t:.1f} : {ratio*100:.2f}%")
+
+    if hasattr(gaussians, "static_mask_logit") and gaussians.static_mask_logit is not None and gaussians.static_mask_logit.numel() > 0:
+        phi_sta = torch.sigmoid(gaussians.static_mask_logit.detach()).view(-1).cpu()
+        print("Total static gaussians:", phi_sta.shape[0])
+        print("phi min :", phi_sta.min().item())
+        print("phi max :", phi_sta.max().item())
+        print("phi mean:", phi_sta.mean().item())
+        print("phi std :", phi_sta.std().item())
+
+        print("\nRatio below thresholds:")
+        for t in thresholds:
+            ratio = (phi_sta < t).float().mean().item()
+            print(f"phi < {t:.1f} : {ratio*100:.2f}%")
+
+    print("\n==================================================\n")
+
+    # ---------------- Hard Pruning ----------------
+    print("\n================ Hard Pruning Pipeline ================\n")
+
+    dynamic_points_before = gaussians.get_xyz.shape[0]
+    static_points_before = gaussians.get_static_xyz.shape[0]
+    baseline_points = dynamic_points_before + static_points_before
+
+    print(f"\n[Baseline]")
+    print(f"Points          : {baseline_points}")
+    print(f"Dynamic_Points  : {dynamic_points_before}")
+    print(f"Static_Points   : {static_points_before}")
+
+    print("\nEvaluating model BEFORE pruning on all test views...")
+    all_test_views = list(scene.getTestCameras())
+    psnr_before_list = []
+    ssim_before_list = []
+    lpips_before_list = []
+
+    for gt_image, viewpoint_cam in all_test_views:
+        gt_image, viewpoint_cam = gt_image.cuda(), viewpoint_cam.cuda()
+
+        with torch.no_grad():
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+            image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+            
+            image_lpips = image.unsqueeze(0) * 2.0 - 1.0
+            gt_lpips = gt_image.unsqueeze(0) * 2.0 - 1.0
+
+            psnr_before_list.append(psnr(image, gt_image).mean().item())
+            ssim_before_list.append(ssim(image, gt_image).item())
+            lpips_before_list.append(lpips_fn(image_lpips, gt_lpips).mean().item())
+
+        del render_pkg, image, gt_image, viewpoint_cam
+        torch.cuda.empty_cache()
+
+    psnr_before = sum(psnr_before_list) / len(psnr_before_list)
+    ssim_before = sum(ssim_before_list) / len(ssim_before_list)
+    lpips_before = sum(lpips_before_list) / len(lpips_before_list)
+
+    print(f"\nPSNR before pruning: {psnr_before:.4f}")
+    print(f"SSIM before pruning: {ssim_before:.6f}")
+    print(f"LPIPS before pruning: {lpips_before:.6f}")
+
+    print("\nApplying hard pruning...")
+
+    phi_prune_dynamic = getattr(opt, "phi_prune_dynamic", 0.1)
+    phi_prune_static = getattr(opt, "phi_prune_static", 0.1)
+
+    if opt.use_pruning:
+        gaussians.prune_low_dynamic_mask_points(threshold=phi_prune_dynamic)
+        gaussians.prune_low_mask_points(threshold=phi_prune_static)
+
+    dynamic_points_after = gaussians.get_xyz.shape[0]
+    static_points_after = gaussians.get_static_xyz.shape[0]
+    new_count = dynamic_points_after + static_points_after
+    compression = (1 - new_count / baseline_points) * 100 if baseline_points > 0 else 0.0
+
+    print(f"\n[Hard Pruning]")
+    print(f"Dynamic before : {dynamic_points_before}")
+    print(f"Dynamic after  : {dynamic_points_after}")
+    print(f"Static before  : {static_points_before}")
+    print(f"Static after   : {static_points_after}")
+    print(f"Points before  : {baseline_points}")
+    print(f"Points after   : {new_count}")
+    print(f"Reduction      : {compression:.2f}%")
+    print(f"phi_prune_dynamic = {phi_prune_dynamic}")
+    print(f"phi_prune_static  = {phi_prune_static}")
+
+    # ---------------- PSNR Evaluation ----------------
+    print("\nEvaluating pruned model on all test views...")
+    all_test_views = list(scene.getTestCameras())
+    psnr_pruned_list = []
+    ssim_pruned_list = []
+    lpips_pruned_list = []
+
+    for gt_image, viewpoint_cam in all_test_views:
+        gt_image, viewpoint_cam = gt_image.cuda(), viewpoint_cam.cuda()
+
+        with torch.no_grad():
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+            image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+
+            image_lpips = image.unsqueeze(0) * 2.0 - 1.0
+            gt_lpips = gt_image.unsqueeze(0) * 2.0 - 1.0
+
+            psnr_pruned_list.append(psnr(image, gt_image).mean().item())
+            ssim_pruned_list.append(ssim(image, gt_image).item())
+            lpips_pruned_list.append(lpips_fn(image_lpips, gt_lpips).mean().item())
+
+        del render_pkg, image, gt_image, viewpoint_cam
+        torch.cuda.empty_cache()
+
+    psnr_pruned = sum(psnr_pruned_list) / len(psnr_pruned_list)
+    ssim_pruned = sum(ssim_pruned_list) / len(ssim_pruned_list)
+    lpips_pruned = sum(lpips_pruned_list) / len(lpips_pruned_list)
+
+    print(f"\nPSNR after pruning: {psnr_pruned:.4f}")
+    print(f"SSIM after pruning: {ssim_pruned:.6f}")
+    print(f"LPIPS after pruning: {lpips_pruned:.6f}")
+
     gaussExtractor = GaussianExtractor(gaussians, render, pipe, bg_color=bg_color)   
     
     #########   1. Validation and Rendering ############
 
-    print("export rendered testing images ...")
-    os.makedirs(test_dir, exist_ok=True)
-    gaussExtractor.reconstruction(scene.getTestCameras(),test_dir,stage = "validation")
-    gaussExtractor.export_image(test_dir,mode = "validation")
+    # print("export rendered testing images ...")
+    # os.makedirs(test_dir, exist_ok=True)
+    # gaussExtractor.reconstruction(scene.getTestCameras(),test_dir,stage = "validation")
+    # gaussExtractor.export_image(test_dir,mode = "validation")
 
     # #########    2. Render Trajectory       ############
     
@@ -146,6 +281,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             batch_point_grad_static = []
             batch_visibility_filter_static = []
             batch_radii_static = []
+
+            batch_alpha_stat = []
+            batch_motion_stat = []
+            batch_time_support_stat = []
             
             for batch_idx in range(batch_size):
                 gt_image, viewpoint_cam = batch_data[batch_idx]
@@ -159,6 +298,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 viewspace_point_tensor_static = render_pkg["viewspace_points_static"]
                 visibility_filter_static = render_pkg["visibility_filter_static"]
                 radii_static = render_pkg["radii_static"]
+
+                alpha_stat = None
+                motion_stat = None
+                time_support_stat = None
+
+                if gaussians.gaussian_dim == 4:
+                    cur_vis = visibility_filter.unsqueeze(1).float()
+
+                    # 1) 当前步 opacity 统计
+                    alpha_stat = gaussians.get_opacity.detach() * cur_vis
+
+                    # 2) 当前步运动强度统计
+                    _, mean_offset = gaussians.get_current_covariance_and_mean_offset(
+                        1.0, viewpoint_cam.timestamp
+                    )
+                    motion_stat = mean_offset.norm(dim=1, keepdim=True).detach() * cur_vis
+
+                    # 3) 当前步时间尺度统计
+                    time_support_stat = gaussians.get_scaling_t.detach() * cur_vis
+
+                    batch_alpha_stat.append(alpha_stat)
+                    batch_motion_stat.append(motion_stat)
+                    batch_time_support_stat.append(time_support_stat)
 
                 # Loss
                 Ll1 = l1_loss(image, gt_image)
@@ -208,6 +370,61 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss = loss + opt.lambda_motion * Lmotion
                 ########################
 
+                ##########gsmask###############
+                if opt.use_pruning and (opt.lambda_static_mask > 0 or opt.lambda_dynamic_mask > 0):
+                    Lstatic_mask = torch.tensor(0.0, device="cuda")
+                    if hasattr(gaussians, "static_mask_logit") and gaussians.static_mask_logit.numel() > 0:
+                        Lstatic_mask = torch.sigmoid(gaussians.static_mask_logit).mean()
+                        if iteration > 3500:
+                            # 3500~4500 iter warmup
+                            warmup = min(1.0, (iteration - 3500) / 1000)
+                            current_lambda_static_mask = opt.lambda_static_mask * warmup
+
+                            loss = loss + current_lambda_static_mask * Lstatic_mask
+
+                    Ldynamic_mask = torch.tensor(0.0, device="cuda")
+                    if hasattr(gaussians, "dynamic_mask_logit") and gaussians.dynamic_mask_logit.numel() > 0:
+                        soft_dyn = torch.sigmoid(gaussians.dynamic_mask_logit).view(-1)
+
+                        # gate：接近静态转换阈值的点，不靠 prune，而靠 dynamic2static
+                        st = gaussians.get_scaling_t.detach().view(-1)
+                        gate = (st < opt.scale_t_threshold).float()
+
+                        # 时间感知统计量
+                        vis = (gaussians.dynamic_vis_denom / (gaussians.denom + 1e-6)).detach().view(-1)
+                        motion = (gaussians.dynamic_motion_accum / (gaussians.dynamic_vis_denom + 1e-6)).detach().view(-1)
+                        tsup = (gaussians.dynamic_time_support_accum / (gaussians.dynamic_vis_denom + 1e-6)).detach().view(-1)
+
+                        vis_norm = vis / (vis.mean() + 1e-6)
+                        motion_norm = motion / (motion.mean() + 1e-6)
+                        tsup_norm = tsup / (tsup.mean() + 1e-6)
+
+                        # 时间感知权重：低可见、弱运动、短时支撑 更容易剪
+                        # exp 形式权重：统计量越大，权重越小
+                        beta_vis = 0.5
+                        beta_motion = 1.0
+                        beta_tsup = 0.25
+
+                        weight = torch.exp(-beta_vis * vis_norm)
+                        weight = weight * torch.exp(-beta_motion * motion_norm)
+                        weight = weight * torch.exp(-beta_tsup * tsup_norm)
+
+                        effective_weight = gate * weight
+                        Ldynamic_mask = (effective_weight * soft_dyn).sum() / (effective_weight.sum() + 1e-6)
+
+                        if iteration > 3500:
+                            warmup = min(1.0, (iteration - 3500) / 500)
+                            current_lambda_dynamic_mask = opt.lambda_dynamic_mask * warmup
+                            loss = loss + current_lambda_dynamic_mask * Ldynamic_mask
+                ##############################
+
+                ###### SH mask Loss ######
+                if opt.lambda_sh > 0:
+                    # 这里先给一个简单的占位逻辑，防止报错
+                    # 实际逻辑应该是计算 SH 系数的稀疏度
+                    Lsh = torch.tensor(0.0, device="cuda") 
+                    loss = loss + opt.lambda_sh * Lsh
+
                 loss = loss / batch_size
                 loss.backward()
                 batch_point_grad.append(torch.norm(viewspace_point_tensor.grad[:,:2], dim=-1))
@@ -227,6 +444,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 visibility_filter = visibility_count > 0
                 radii = torch.stack(batch_radii,1).max(1)[0]
                 
+                batch_alpha_stat_agg = None
+                batch_motion_stat_agg = None
+                batch_time_support_stat_agg = None
+
                 batch_viewspace_point_grad = torch.stack(batch_point_grad,1).sum(1)
                 batch_viewspace_point_grad[visibility_filter] = batch_viewspace_point_grad[visibility_filter] * batch_size / visibility_count[visibility_filter]
                 batch_viewspace_point_grad = batch_viewspace_point_grad.unsqueeze(1)
@@ -244,7 +465,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     batch_t_grad = gaussians._t.grad.clone()[:,0].detach()
                     batch_t_grad[visibility_filter] = batch_t_grad[visibility_filter] * batch_size / visibility_count[visibility_filter]
                     batch_t_grad = batch_t_grad.unsqueeze(1)
+                    
+                    alpha_stack = torch.stack(batch_alpha_stat, dim=1)          # [N, B, 1]
+                    motion_stack = torch.stack(batch_motion_stat, dim=1)        # [N, B, 1]
+                    tsup_stack = torch.stack(batch_time_support_stat, dim=1)    # [N, B, 1]
 
+                    vis_count_unsq = visibility_count.unsqueeze(1).clamp_min(1).float()
+
+                    batch_alpha_stat_agg = alpha_stack.sum(dim=1) / vis_count_unsq
+                    batch_motion_stat_agg = motion_stack.sum(dim=1) / vis_count_unsq
+                    batch_time_support_stat_agg = tsup_stack.sum(dim=1) / vis_count_unsq
             else:
                 if gaussians.gaussian_dim == 4:
                     batch_t_grad = gaussians._t.grad.clone().detach()
@@ -303,11 +533,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if static:
                         gaussians.static_max_radii2D[visibility_filter_static] = torch.max(gaussians.static_max_radii2D[visibility_filter_static], radii_static[visibility_filter_static])
                     if batch_size == 1:
-                        gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, batch_t_grad if gaussians.gaussian_dim == 4 else None)
+                        gaussians.add_densification_stats(
+                            viewspace_point_tensor,
+                            visibility_filter,
+                            batch_t_grad if gaussians.gaussian_dim == 4 else None,
+                            alpha_stat=alpha_stat,
+                            motion_stat=motion_stat,
+                            time_support_stat=time_support_stat,
+                        )
                     else:
-                        gaussians.add_densification_stats_grad(batch_viewspace_point_grad, visibility_filter, batch_t_grad if gaussians.gaussian_dim == 4 else None)
+                        gaussians.add_densification_stats_grad(
+                            batch_viewspace_point_grad,
+                            visibility_filter,
+                            batch_t_grad if gaussians.gaussian_dim == 4 else None,
+                            alpha_stat=batch_alpha_stat_agg if gaussians.gaussian_dim == 4 else None,
+                            motion_stat=batch_motion_stat_agg if gaussians.gaussian_dim == 4 else None,
+                            time_support_stat=batch_time_support_stat_agg if gaussians.gaussian_dim == 4 else None,
+                        )
                         if static:
-                            gaussians.add_densification_stats_grad_static(batch_viewspace_point_grad_static, visibility_filter_static)
+                            gaussians.add_densification_stats_grad_static(
+                                batch_viewspace_point_grad_static,
+                                visibility_filter_static
+                            )
 
                     if iteration > opt.densify_from_iter: 
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -324,8 +571,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if pipe.env_map_res and iteration < pipe.env_optimize_until:
                         env_map_optimizer.step()
                         env_map_optimizer.zero_grad(set_to_none = True)
-
-
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

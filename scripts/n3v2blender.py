@@ -443,7 +443,8 @@ if __name__ == '__main__':
                 --output_path  {os.path.join(colmap_workspace, 'dense')}")
     
     do_system(f"colmap patch_match_stereo   \
-                --workspace_path   {os.path.join(colmap_workspace, 'dense')}")
+                --workspace_path   {os.path.join(colmap_workspace, 'dense')}\
+                --PatchMatchStereo.gpu_index 0")
     
     do_system(f"colmap stereo_fusion    \
                 --workspace_path {os.path.join(colmap_workspace, 'dense')} \

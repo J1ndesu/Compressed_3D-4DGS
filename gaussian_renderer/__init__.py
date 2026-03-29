@@ -16,6 +16,7 @@ from .diff_gaussian_rasterization import GaussianRasterizationSettings, Gaussian
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh, eval_shfs_4d
 from collections import defaultdict
+from utils.compression_utils import get_ste_mask, get_sh_masks
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
@@ -62,6 +63,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
+    
+    if hasattr(pc, "dynamic_mask_logit"):
+        m = get_ste_mask(pc.dynamic_mask_logit)
+        opacity = opacity * m
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -83,6 +88,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         scales = pc.get_scaling
         rotations = pc.get_rotation
+
+        if hasattr(pc, "dynamic_mask_logit"):
+            scales = scales * m
+
         if pc.gaussian_dim == 4:
             scales_t = pc.get_scaling_t
             ts = pc.get_t
@@ -159,6 +168,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     scales_static = pc.get_static_scaling
     rotations_static = pc.get_static_rotation 
 
+    if hasattr(pc, "static_mask_logit") and len(means3D_static) > 0:
+        sm = get_ste_mask(pc.static_mask_logit)
+        opacity_static = opacity_static * sm
+        scales_static = scales_static * sm
+    
     rendered_image, radii, depth, alpha, flow, covs_com, radii_static, color_4d, color_3d, invdepth = rasterizer(
         means3D = means3D,
         means2D = means2D,

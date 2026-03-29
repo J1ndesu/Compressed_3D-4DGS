@@ -21,6 +21,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.sh_utils import sh_channels_4d
+from utils.compression_utils import get_ste_mask, get_sh_masks
 
 class GaussianModel:
 
@@ -147,8 +148,10 @@ class GaussianModel:
                 self.static_rotation,
                 self.static_opacity,
                 self.static_max_radii2D,
+                self.static_denom,
                 self.static_xyz_gradient_accum,
-                self.static_denom
+                self.dynamic_mask_logit,
+                self.static_mask_logit
             )
     
     def restore(self, model_args, training_args):
@@ -193,12 +196,16 @@ class GaussianModel:
             self.static_opacity,
             self.static_max_radii2D,
             self.static_denom,
-            self.static_xyz_gradient_accum) = model_args
+            self.static_xyz_gradient_accum,
+            self.dynamic_mask_logit,
+            self.static_mask_logit) = model_args
+        
+        self.xyz_gradient_accum = xyz_gradient_accum
+        self.t_gradient_accum = t_gradient_accum
+        self.denom = denom
+    
         if training_args is not None:
             self.training_setup(training_args)
-            self.xyz_gradient_accum = xyz_gradient_accum
-            self.t_gradient_accum = t_gradient_accum
-            self.denom = denom
             self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -467,6 +474,24 @@ class GaussianModel:
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+        
+        # 设定 mask 的基础学习率
+        self.mask_lr = training_args.mask_lr # 建议 0.01 左右
+
+        # 初始化高斯剪枝掩码
+        if training_args.use_pruning:
+            mask_init = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+            self.dynamic_mask_logit = nn.Parameter(mask_init.requires_grad_(True))
+            
+            # 将其加入优化器参数组
+            self.optimizer.add_param_group({
+                'params': [self.dynamic_mask_logit], 
+                'lr': self.mask_lr, 
+                "name": "dynamic_mask_logit"
+            })
+            
+            self.static_mask_logit = torch.empty((0, 1), device="cuda")
+        
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -529,6 +554,30 @@ class GaussianModel:
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
+        if self.optimizer is None:
+            self._xyz = nn.Parameter(self._xyz[valid_points_mask].requires_grad_(True))
+            self._features_dc = nn.Parameter(self._features_dc[valid_points_mask].requires_grad_(True))
+            self._features_rest = nn.Parameter(self._features_rest[valid_points_mask].requires_grad_(True))
+            self._opacity = nn.Parameter(self._opacity[valid_points_mask].requires_grad_(True))
+            self._scaling = nn.Parameter(self._scaling[valid_points_mask].requires_grad_(True))
+            self._rotation = nn.Parameter(self._rotation[valid_points_mask].requires_grad_(True))
+
+            self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+            self.denom = self.denom[valid_points_mask]
+            self.max_radii2D = self.max_radii2D[valid_points_mask]
+
+            if self.gaussian_dim == 4:
+                self._t = nn.Parameter(self._t[valid_points_mask].requires_grad_(True))
+                self._scaling_t = nn.Parameter(self._scaling_t[valid_points_mask].requires_grad_(True))
+                if self.rot_4d:
+                    self._rotation_r = nn.Parameter(self._rotation_r[valid_points_mask].requires_grad_(True))
+                self.t_gradient_accum = self.t_gradient_accum[valid_points_mask]
+
+            if hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit is not None and self.dynamic_mask_logit.numel() > 0:
+                self.dynamic_mask_logit = nn.Parameter(self.dynamic_mask_logit[valid_points_mask].requires_grad_(True))
+            
+            return
+    
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
@@ -537,6 +586,9 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+        if "dynamic_mask_logit" in optimizable_tensors:
+            self.dynamic_mask_logit = optimizable_tensors["dynamic_mask_logit"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -552,6 +604,22 @@ class GaussianModel:
 
     def prune_static_points(self, mask):
         valid_points_mask = ~mask
+        if self.optimizer is None:
+            self.static_xyz = nn.Parameter(self.static_xyz[valid_points_mask].requires_grad_(True))
+            self.static_features_dc = nn.Parameter(self.static_features_dc[valid_points_mask].requires_grad_(True))
+            self.static_features_rest = nn.Parameter(self.static_features_rest[valid_points_mask].requires_grad_(True))
+            self.static_opacity = nn.Parameter(self.static_opacity[valid_points_mask].requires_grad_(True))
+            self.static_scaling = nn.Parameter(self.static_scaling[valid_points_mask].requires_grad_(True))
+            self.static_rotation = nn.Parameter(self.static_rotation[valid_points_mask].requires_grad_(True))
+
+            self.static_xyz_gradient_accum = self.static_xyz_gradient_accum[valid_points_mask]
+            self.static_denom = self.static_denom[valid_points_mask]
+            self.static_max_radii2D = self.static_max_radii2D[valid_points_mask]
+
+            if hasattr(self, "static_mask_logit") and self.static_mask_logit is not None and self.static_mask_logit.numel() > 0:
+                self.static_mask_logit = nn.Parameter(self.static_mask_logit[valid_points_mask].requires_grad_(True))
+            return
+        
         optimizable_tensors = self._prune_optimizer(valid_points_mask, static=True)
 
         self.static_xyz = optimizable_tensors["static_xyz"]
@@ -561,10 +629,12 @@ class GaussianModel:
         self.static_scaling = optimizable_tensors["static_scaling"]
         self.static_rotation = optimizable_tensors["static_rotation"]
 
+        if "static_mask_logit" in optimizable_tensors:
+            self.static_mask_logit = optimizable_tensors["static_mask_logit"]
+        
         self.static_xyz_gradient_accum = self.static_xyz_gradient_accum[valid_points_mask]
         self.static_denom = self.static_denom[valid_points_mask]
-        self.static_max_radii2D = self.static_max_radii2D[valid_points_mask]
-        
+        self.static_max_radii2D = self.static_max_radii2D[valid_points_mask]     
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -591,7 +661,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_mask_logit = None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -599,6 +669,10 @@ class GaussianModel:
         "scaling" : new_scaling,
         "rotation" : new_rotation,
         }
+
+        if new_mask_logit is not None:
+            d["dynamic_mask_logit"] = new_mask_logit
+
         if self.gaussian_dim == 4:
             d["t"] = new_t
             d["scaling_t"] = new_scaling_t
@@ -612,6 +686,10 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+        if "dynamic_mask_logit" in optimizable_tensors:
+            self.dynamic_mask_logit = optimizable_tensors["dynamic_mask_logit"]
+
         if self.gaussian_dim == 4:
             self._t = optimizable_tensors['t']
             self._scaling_t = optimizable_tensors['scaling_t']
@@ -623,7 +701,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densification_postfix_static(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix_static(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_static_mask_logit = None):
         d = {"static_xyz": new_xyz,
         "static_f_dc": new_features_dc,
         "static_f_rest": new_features_rest,
@@ -631,6 +709,20 @@ class GaussianModel:
         "static_scaling" : new_scaling,
         "static_rotation" : new_rotation,
         }
+
+        if new_static_mask_logit is not None:
+            group_names = [group["name"] for group in self.optimizer.param_groups]
+            
+            if "static_mask_logit" not in group_names:
+                self.static_mask_logit = nn.Parameter(new_static_mask_logit.requires_grad_(True))
+                self.optimizer.add_param_group({
+                    'params': [self.static_mask_logit], 
+                    'lr': self.mask_lr, 
+                    "name": "static_mask_logit"
+                })
+            else:
+                d["static_mask_logit"] = new_static_mask_logit
+
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self.static_xyz = optimizable_tensors["static_xyz"]
         self.static_features_dc = optimizable_tensors["static_f_dc"]
@@ -638,6 +730,9 @@ class GaussianModel:
         self.static_opacity = optimizable_tensors["static_opacity"]
         self.static_scaling = optimizable_tensors["static_scaling"]
         self.static_rotation = optimizable_tensors["static_rotation"]
+
+        if "static_mask_logit" in optimizable_tensors:
+            self.static_mask_logit = optimizable_tensors["static_mask_logit"]
 
         self.static_max_radii2D = torch.zeros((self.static_xyz.shape[0]), device="cuda")
         self.static_denom = torch.zeros((self.static_xyz.shape[0], 1), device="cuda")
@@ -687,8 +782,12 @@ class GaussianModel:
             new_scaling_t = self.scaling_inverse_activation(self.get_scaling_t[selected_pts_mask].repeat(N,1) / (0.8*N))
             new_t = new_xyzt[...,3:4]
             new_rotation_r = self._rotation_r[selected_pts_mask].repeat(N,1)
+        
+        new_mask_logit = None
+        if hasattr(self, "dynamic_mask_logit"):
+            new_mask_logit = self.dynamic_mask_logit[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_mask_logit)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -717,7 +816,11 @@ class GaussianModel:
             if self.rot_4d:
                 new_rotation_r = self._rotation_r[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r)
+        new_mask_logit = None
+        if hasattr(self, "dynamic_mask_logit"):
+            new_mask_logit = self.dynamic_mask_logit[selected_pts_mask]
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_mask_logit)
 
     def densify_and_split_static(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_static_xyz.shape[0]
@@ -740,7 +843,11 @@ class GaussianModel:
         rots = build_rotation(self.static_rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_static_xyz[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        new_static_mask_logit = None
+        if hasattr(self, "static_mask_logit"):
+            new_static_mask_logit = self.static_mask_logit[selected_pts_mask].repeat(N, 1)
+
+        self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_static_mask_logit)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_static_points(prune_filter)
@@ -758,7 +865,11 @@ class GaussianModel:
         new_scaling = self.static_scaling[selected_pts_mask]
         new_rotation = self.static_rotation[selected_pts_mask]
 
-        self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        new_static_mask_logit = None
+        if hasattr(self, "static_mask_logit"):
+            new_static_mask_logit = self.static_mask_logit[selected_pts_mask]
+
+        self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_static_mask_logit)
 
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, max_grad_t=None, prune_only=False, dynamic_only=False):
@@ -818,6 +929,11 @@ class GaussianModel:
         static_mask = (self.get_scaling_t > scale_threshold).squeeze()
         if static_mask.sum() == 0:
             return
+        
+        new_mask_logit = None
+        if hasattr(self, "dynamic_mask_logit"):
+            new_mask_logit = self.dynamic_mask_logit[static_mask]
+
         new_xyz = self._xyz[static_mask]
         new_features_dc = self._features_dc[static_mask]
         new_features_rest = self._features_rest[static_mask]
@@ -829,4 +945,65 @@ class GaussianModel:
 
         self.prune_points(static_mask)
 
-        self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_static_mask_logit=new_mask_logit)
+
+    def prune_low_mask_points(self, threshold=0.1):
+        if (hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit is not None and self.dynamic_mask_logit.numel() > 0 and hasattr(self, "_xyz") and self._xyz.shape[0] > 0):
+            # soft mask
+            dm = torch.sigmoid(self.dynamic_mask_logit)
+
+            # keep mask
+            keep_dynamic_mask = (dm > threshold).squeeze()
+            if keep_dynamic_mask.dim() == 0:
+                keep_dynamic_mask = keep_dynamic_mask.unsqueeze(0)
+
+            # 真正剪掉低于阈值的动态点
+            if not keep_dynamic_mask.all():
+                prune_dynamic_mask = ~keep_dynamic_mask
+                self.prune_points(prune_dynamic_mask)
+
+        # 兜底：对齐 dynamic_mask_logit 长度到当前动态池
+        if hasattr(self, "dynamic_mask_logit") and hasattr(self, "_xyz"):
+            new_dynamic = self._xyz.shape[0]
+
+            if self.dynamic_mask_logit.numel() == 0 and new_dynamic > 0:
+                pad = torch.full((new_dynamic, 1), 0.0, device="cuda")
+                self.dynamic_mask_logit = nn.Parameter(pad)
+
+            elif self.dynamic_mask_logit.shape[0] != new_dynamic:
+                diff = new_dynamic - self.dynamic_mask_logit.shape[0]
+                if diff > 0:
+                    pad = torch.full((diff, 1), 0.0, device="cuda", dtype=self.dynamic_mask_logit.dtype)
+                    self.dynamic_mask_logit = nn.Parameter(torch.cat([self.dynamic_mask_logit, pad], dim=0))
+                else:
+                    self.dynamic_mask_logit = nn.Parameter(self.dynamic_mask_logit[:new_dynamic])
+        
+        if (hasattr(self, "static_mask_logit") and self.static_mask_logit is not None and self.static_mask_logit.numel() > 0 and hasattr(self, "static_xyz") and self.static_xyz.shape[0] > 0):
+            # soft mask
+            sm = torch.sigmoid(self.static_mask_logit)
+
+            # keep mask
+            keep_static_mask = (sm > threshold).squeeze()
+            if keep_static_mask.dim() == 0:
+                keep_static_mask = keep_static_mask.unsqueeze(0)
+
+            # 真正剪掉低于阈值的静态点
+            if not keep_static_mask.all():
+                prune_static_mask = ~keep_static_mask
+                self.prune_static_points(prune_static_mask)
+
+        # 兜底：对齐 static_mask_logit 长度到当前静态池
+        if hasattr(self, "static_mask_logit") and hasattr(self, "static_xyz"):
+            new_static = self.static_xyz.shape[0]
+
+            if self.static_mask_logit.numel() == 0 and new_static > 0:
+                pad = torch.full((new_static, 1), 0.0, device="cuda")
+                self.static_mask_logit = nn.Parameter(pad)
+
+            elif self.static_mask_logit.shape[0] != new_static:
+                diff = new_static - self.static_mask_logit.shape[0]
+                if diff > 0:
+                    pad = torch.full((diff, 1), 0.0, device="cuda", dtype=self.static_mask_logit.dtype)
+                    self.static_mask_logit = nn.Parameter(torch.cat([self.static_mask_logit, pad], dim=0))
+                else:
+                    self.static_mask_logit = nn.Parameter(self.static_mask_logit[:new_static])

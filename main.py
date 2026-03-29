@@ -12,6 +12,7 @@
 import os
 import random
 import torch
+import lpips
 from torch import nn
 from utils.loss_utils import l1_loss, ssim, msssim
 from gaussian_renderer import render
@@ -31,6 +32,7 @@ from torch.utils.data import DataLoader
 
 from utils.mesh_utils import GaussianExtractor
 from utils.render_utils import generate_path, create_videos
+from utils.compression_utils import get_ste_mask, get_sh_masks
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -42,7 +44,8 @@ def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4
                num_pts, num_pts_ratio):
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-    
+    lpips_fn = lpips.LPIPS(net='alex').cuda().eval()
+
     gaussians = GaussianModel(dataset.sh_degree, gaussian_dim=gaussian_dim, time_duration=time_duration, 
                               rot_4d=rot_4d, force_sh_3d=force_sh_3d, sh_degree_t=2 if pipe.eval_shfs_4d else 0)
     
@@ -53,14 +56,144 @@ def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4
     train_dir = os.path.join(dataset.model_path, 'train', "ours_{}".format(first_iter))
     test_dir = os.path.join(dataset.model_path, 'test', "ours_{}".format(first_iter))
     gaussians.restore(model_params, None)
+
+    # ---------------- Phi Distribution ----------------
+    print("\n================ Phi Distribution ================\n")
+    thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+    if hasattr(gaussians, "dynamic_mask_logit") and gaussians.dynamic_mask_logit is not None and gaussians.dynamic_mask_logit.numel() > 0:
+        phi_dyn = torch.sigmoid(gaussians.dynamic_mask_logit.detach()).view(-1).cpu()
+        print("Total dynamic gaussians:", phi_dyn.shape[0])
+        print("dynamic phi min :", phi_dyn.min().item())
+        print("dynamic phi max :", phi_dyn.max().item())
+        print("dynamic phi mean:", phi_dyn.mean().item())
+        print("dynamic phi std :", phi_dyn.std().item())
+
+        print("\nRatio below thresholds:")
+        for t in thresholds:
+            ratio = (phi_dyn < t).float().mean().item()
+            print(f"phi_dyn < {t:.1f} : {ratio*100:.2f}%")
+
+    if hasattr(gaussians, "static_mask_logit") and gaussians.static_mask_logit is not None and gaussians.static_mask_logit.numel() > 0:
+        phi_sta = torch.sigmoid(gaussians.static_mask_logit.detach()).view(-1).cpu()
+        print("Total static gaussians:", phi_sta.shape[0])
+        print("phi min :", phi_sta.min().item())
+        print("phi max :", phi_sta.max().item())
+        print("phi mean:", phi_sta.mean().item())
+        print("phi std :", phi_sta.std().item())
+
+        print("\nRatio below thresholds:")
+        for t in thresholds:
+            ratio = (phi_sta < t).float().mean().item()
+            print(f"phi < {t:.1f} : {ratio*100:.2f}%")
+
+    print("\n==================================================\n")
+
+    # ---------------- Hard Pruning ----------------
+    print("\n================ Hard Pruning Pipeline ================\n")
+
+    dynamic_points_before = gaussians.get_xyz.shape[0]
+    static_points_before = gaussians.get_static_xyz.shape[0]
+    baseline_points = dynamic_points_before + static_points_before
+
+    print(f"\n[Baseline]")
+    print(f"Points          : {baseline_points}")
+    print(f"Dynamic_Points  : {dynamic_points_before}")
+    print(f"Static_Points   : {static_points_before}")
+
+    print("\nEvaluating model BEFORE pruning on all test views...")
+    all_test_views = list(scene.getTestCameras())
+    psnr_before_list = []
+    ssim_before_list = []
+    lpips_before_list = []
+
+    for gt_image, viewpoint_cam in all_test_views:
+        gt_image, viewpoint_cam = gt_image.cuda(), viewpoint_cam.cuda()
+
+        with torch.no_grad():
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+            image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+            
+            image_lpips = image.unsqueeze(0) * 2.0 - 1.0
+            gt_lpips = gt_image.unsqueeze(0) * 2.0 - 1.0
+
+            psnr_before_list.append(psnr(image, gt_image).mean().item())
+            ssim_before_list.append(ssim(image, gt_image).item())
+            lpips_before_list.append(lpips_fn(image_lpips, gt_lpips).mean().item())
+
+        del render_pkg, image, gt_image, viewpoint_cam
+        torch.cuda.empty_cache()
+
+    psnr_before = sum(psnr_before_list) / len(psnr_before_list)
+    ssim_before = sum(ssim_before_list) / len(ssim_before_list)
+    lpips_before = sum(lpips_before_list) / len(lpips_before_list)
+
+    print(f"\nPSNR before pruning: {psnr_before:.4f}")
+    print(f"SSIM before pruning: {ssim_before:.6f}")
+    print(f"LPIPS before pruning: {lpips_before:.6f}")
+
+    print("\nApplying hard pruning...")
+
+    phi_threshold = getattr(opt, "phi_threshold", 0.1)
+
+    if opt.use_pruning:
+        gaussians.prune_low_mask_points(threshold=phi_threshold)
+
+    dynamic_points_after = gaussians.get_xyz.shape[0]
+    static_points_after = gaussians.get_static_xyz.shape[0]
+    new_count = dynamic_points_after + static_points_after
+    compression = (1 - new_count / baseline_points) * 100 if baseline_points > 0 else 0.0
+
+    print(f"\n[Hard Pruning]")
+    print(f"Dynamic before : {dynamic_points_before}")
+    print(f"Dynamic after  : {dynamic_points_after}")
+    print(f"Static before  : {static_points_before}")
+    print(f"Static after   : {static_points_after}")
+    print(f"Points before  : {baseline_points}")
+    print(f"Points after   : {new_count}")
+    print(f"Reduction      : {compression:.2f}%")
+    print(f"phi_threshold = {phi_threshold}")
+
+    # ---------------- PSNR Evaluation ----------------
+    print("\nEvaluating pruned model on all test views...")
+    all_test_views = list(scene.getTestCameras())
+    psnr_pruned_list = []
+    ssim_pruned_list = []
+    lpips_pruned_list = []
+
+    for gt_image, viewpoint_cam in all_test_views:
+        gt_image, viewpoint_cam = gt_image.cuda(), viewpoint_cam.cuda()
+
+        with torch.no_grad():
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+            image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+
+            image_lpips = image.unsqueeze(0) * 2.0 - 1.0
+            gt_lpips = gt_image.unsqueeze(0) * 2.0 - 1.0
+
+            psnr_pruned_list.append(psnr(image, gt_image).mean().item())
+            ssim_pruned_list.append(ssim(image, gt_image).item())
+            lpips_pruned_list.append(lpips_fn(image_lpips, gt_lpips).mean().item())
+
+        del render_pkg, image, gt_image, viewpoint_cam
+        torch.cuda.empty_cache()
+
+    psnr_pruned = sum(psnr_pruned_list) / len(psnr_pruned_list)
+    ssim_pruned = sum(ssim_pruned_list) / len(ssim_pruned_list)
+    lpips_pruned = sum(lpips_pruned_list) / len(lpips_pruned_list)
+
+    print(f"\nPSNR after pruning: {psnr_pruned:.4f}")
+    print(f"SSIM after pruning: {ssim_pruned:.6f}")
+    print(f"LPIPS after pruning: {lpips_pruned:.6f}")
+
     gaussExtractor = GaussianExtractor(gaussians, render, pipe, bg_color=bg_color)   
     
     #########   1. Validation and Rendering ############
 
-    print("export rendered testing images ...")
-    os.makedirs(test_dir, exist_ok=True)
-    gaussExtractor.reconstruction(scene.getTestCameras(),test_dir,stage = "validation")
-    gaussExtractor.export_image(test_dir,mode = "validation")
+    # print("export rendered testing images ...")
+    # os.makedirs(test_dir, exist_ok=True)
+    # gaussExtractor.reconstruction(scene.getTestCameras(),test_dir,stage = "validation")
+    # gaussExtractor.export_image(test_dir,mode = "validation")
 
     # #########    2. Render Trajectory       ############
     
@@ -206,6 +339,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     _, velocity = gaussians.get_current_covariance_and_mean_offset(1.0, gaussians.get_t + 0.1)
                     Lmotion = velocity.norm(p=2, dim=1).mean()
                     loss = loss + opt.lambda_motion * Lmotion
+                ########################
+
+                ########################
+                ###### RDO mask loss ######
+                if opt.use_pruning:
+                    if opt.lambda_mask > 0:
+                        if iteration > 3500:
+                            Lmask = torch.sigmoid(gaussians.dynamic_mask_logit).mean()
+                            if hasattr(gaussians, "static_mask_logit") and len(gaussians.static_xyz) > 0:
+                                Lmask = Lmask + torch.sigmoid(gaussians.static_mask_logit).mean()
+                            current_lambda_mask = opt.lambda_mask * min(1.0, (iteration - 3500) / 1000)
+                            
+                            loss = loss + current_lambda_mask * Lmask
+                        else:
+                            Lmask = torch.sigmoid(gaussians.dynamic_mask_logit).mean()
                 ########################
 
                 loss = loss / batch_size

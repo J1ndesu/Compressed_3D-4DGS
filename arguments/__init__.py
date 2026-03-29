@@ -109,6 +109,23 @@ class OptimizationParams(ParamGroup):
         self.lambda_rigid = 0.0
         self.lambda_motion = 0.0
         self.scale_t_threshold =3.0
+
+        self.use_pruning = False            # 是否开启高斯剪枝开关
+        self.use_sh_adaptive = False        # 是否开启SH自适应剪枝
+        self.use_vq = False                 # 是否开启矢量量化
+        
+        self.lambda_mask = 0.0005          # λ_GSprune
+        self.lambda_sh = 0.0                # λ_SHprune
+        self.phi_threshold = 0.1            # STE 二值化阈值 φ_thres
+        
+        # 针对 ECVQ 的超参数
+        self.lambda_vqr = 0.000             # 旋转量化的率失真权重 λ(r)
+        self.lambda_vqs = 0.000             # 缩放量化的率失真权重 λ(s)
+        self.lambda_vqc = 0.000             # 颜色量化的率失真权重 λ(c)
+        
+        self.mask_lr = 0.01                 # 掩码 Logits 的学习率
+        self.codebook_lr = 0.0              # VQ 码本的学习率
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

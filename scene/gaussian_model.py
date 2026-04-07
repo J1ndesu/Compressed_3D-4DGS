@@ -108,6 +108,10 @@ class GaussianModel:
         self.static_denom = torch.empty(0)
         self.static_xyz_gradient_accum = torch.empty(0)
         
+        self.use_pruning = False
+        self.use_sh_adaptive = False
+        self.enable_sh_mask = False
+
         self.setup_functions()
 
     def capture(self):
@@ -161,7 +165,9 @@ class GaussianModel:
                 self.dynamic_vis_denom,
                 self.dynamic_alpha_accum,
                 self.dynamic_motion_accum,
-                self.dynamic_time_support_accum
+                self.dynamic_time_support_accum,
+                self.dynamic_sh_mask_logit,
+                self.static_sh_mask_logit
             )
     
     def restore(self, model_args, training_args):
@@ -212,7 +218,9 @@ class GaussianModel:
             self.dynamic_vis_denom,
             self.dynamic_alpha_accum,
             self.dynamic_motion_accum,
-            self.dynamic_time_support_accum) = model_args
+            self.dynamic_time_support_accum,
+            self.dynamic_sh_mask_logit,
+            self.static_sh_mask_logit) = model_args
 
         self.xyz_gradient_accum = xyz_gradient_accum
         self.t_gradient_accum = t_gradient_accum
@@ -220,6 +228,18 @@ class GaussianModel:
         if training_args is not None:
             self.training_setup(training_args)
             self.optimizer.load_state_dict(opt_dict)
+            self.enable_sh_mask = False
+        
+        if training_args is None:
+            self.use_pruning = (
+                (hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit is not None and self.dynamic_mask_logit.numel() > 0) or
+                (hasattr(self, "static_mask_logit") and self.static_mask_logit is not None and self.static_mask_logit.numel() > 0)
+            )
+            self.use_sh_adaptive = (
+                (hasattr(self, "dynamic_sh_mask_logit") and self.dynamic_sh_mask_logit is not None and self.dynamic_sh_mask_logit.numel() > 0) or
+                (hasattr(self, "static_sh_mask_logit") and self.static_sh_mask_logit is not None and self.static_sh_mask_logit.numel() > 0)
+            )
+            self.enable_sh_mask = self.use_sh_adaptive
 
     @property
     def get_scaling(self):
@@ -457,6 +477,12 @@ class GaussianModel:
         self.use_pruning = training_args.use_pruning
         self.use_sh_adaptive = training_args.use_sh_adaptive
         self.use_vq = training_args.use_vq
+        self.enable_sh_mask = False
+
+        self.static_mask_lr = training_args.static_mask_lr
+        self.dynamic_mask_lr = training_args.dynamic_mask_lr
+        self.sh_mask_lr = training_args.sh_mask_lr
+        self.codebook_lr = training_args.codebook_lr
       
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -498,19 +524,14 @@ class GaussianModel:
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
 
-        # ---------- 剪枝 mask 初始化 ----------
+        dyn_num = self._xyz.shape[0]
         if self.use_pruning:
             self.static_mask_lr = training_args.static_mask_lr
             self.dynamic_mask_lr = training_args.dynamic_mask_lr
             self.lambda_static_mask = training_args.lambda_static_mask
             self.lambda_dynamic_mask = training_args.lambda_dynamic_mask
             self.phi_threshold = training_args.phi_threshold
-            
-            # 静态 mask
-            self.static_mask_logit = torch.empty((0, 1), device="cuda", dtype=torch.float32)
-
-            # 动态 mask：当前已经有动态点，直接初始化
-            dyn_num = self._xyz.shape[0]
+            self.static_mask_logit = torch.empty((0, 1), device="cuda", dtype=torch.float32)            
             dyn_init = torch.full((dyn_num, 1), 0.0, device="cuda", dtype=torch.float32)
             self.dynamic_mask_logit = nn.Parameter(dyn_init.requires_grad_(True))
 
@@ -523,16 +544,22 @@ class GaussianModel:
             self.static_mask_logit = torch.empty((0, 1), device="cuda", dtype=torch.float32)
             self.dynamic_mask_logit = torch.empty((0, 1), device="cuda", dtype=torch.float32)
 
-        # ---------- SH 自适应 ----------
         if self.use_sh_adaptive:
-            sh_mask_init = torch.ones((self._xyz.shape[0], 3), device="cuda") * training_args.mask_logit_init
-            self._sh_mask_logit = nn.Parameter(sh_mask_init.requires_grad_(True))
+            self.sh_mask_lr = training_args.sh_mask_lr
+            self.lambda_sh = training_args.lambda_sh
+            self.phi_prune_sh = training_args.phi_prune_sh
+            self.static_sh_mask_logit = torch.empty((0, 3), device="cuda", dtype=torch.float32)
+            dynamic_sh_mask_init = torch.full((dyn_num, 3), 0.0, device="cuda", dtype=torch.float32)
+            self.dynamic_sh_mask_logit = nn.Parameter(dynamic_sh_mask_init.requires_grad_(True))
 
             self.optimizer.add_param_group({
-                'params': [self._sh_mask_logit],
-                'lr': self.mask_lr,
-                "name": "sh_mask_logit"
+                'params': [self.dynamic_sh_mask_logit],
+                'lr': self.sh_mask_lr,
+                "name": "dynamic_sh_mask_logit"
             })
+        else:
+            self.dynamic_sh_mask_logit = torch.empty((0, 3), device="cuda", dtype=torch.float32)
+            self.static_sh_mask_logit = torch.empty((0, 3), device="cuda", dtype=torch.float32)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -581,7 +608,6 @@ class GaussianModel:
 
             params = group["params"][0]
         
-            # 形状对齐：如果 mask 长度和这个参数对不上，跳过它
             if params.shape[0] != mask.shape[0]:
                 # print(f"Skipping {group['name']} due to shape mismatch")
                 optimizable_tensors[group["name"]] = params
@@ -633,8 +659,12 @@ class GaussianModel:
                 if hasattr(self, "dynamic_time_support_accum"):
                     self.dynamic_time_support_accum = self.dynamic_time_support_accum[valid_points_mask]
 
-            if hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit is not None and self.dynamic_mask_logit.numel() > 0:
+            if self.use_pruning and hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit is not None and self.dynamic_mask_logit.numel() > 0:
                 self.dynamic_mask_logit = nn.Parameter(self.dynamic_mask_logit[valid_points_mask].requires_grad_(True))
+            
+            if self.use_sh_adaptive and hasattr(self, "dynamic_sh_mask_logit") and self.dynamic_sh_mask_logit is not None and self.dynamic_sh_mask_logit.numel() > 0:
+                self.dynamic_sh_mask_logit = nn.Parameter(self.dynamic_sh_mask_logit[valid_points_mask].requires_grad_(True))
+
             return
         
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
@@ -666,6 +696,9 @@ class GaussianModel:
         if "dynamic_mask_logit" in optimizable_tensors:
             self.dynamic_mask_logit = optimizable_tensors["dynamic_mask_logit"]
 
+        if "dynamic_sh_mask_logit" in optimizable_tensors:
+            self.dynamic_sh_mask_logit = optimizable_tensors["dynamic_sh_mask_logit"]
+
     def prune_static_points(self, mask):
         valid_points_mask = ~mask
         
@@ -681,8 +714,12 @@ class GaussianModel:
             self.static_denom = self.static_denom[valid_points_mask]
             self.static_max_radii2D = self.static_max_radii2D[valid_points_mask]
 
-            if hasattr(self, "static_mask_logit") and self.static_mask_logit is not None and self.static_mask_logit.numel() > 0:
+            if self.use_pruning and hasattr(self, "static_mask_logit") and self.static_mask_logit is not None and self.static_mask_logit.numel() > 0:
                 self.static_mask_logit = nn.Parameter(self.static_mask_logit[valid_points_mask].requires_grad_(True))
+
+            if self.use_sh_adaptive and hasattr(self, "static_sh_mask_logit") and self.static_sh_mask_logit is not None and self.static_sh_mask_logit.numel() > 0:
+                self.static_sh_mask_logit = nn.Parameter(self.static_sh_mask_logit[valid_points_mask].requires_grad_(True))
+
             return
         
         optimizable_tensors = self._prune_optimizer(valid_points_mask, static=True)
@@ -700,6 +737,9 @@ class GaussianModel:
 
         if "static_mask_logit" in optimizable_tensors:
             self.static_mask_logit = optimizable_tensors["static_mask_logit"]
+        
+        if "static_sh_mask_logit" in optimizable_tensors:
+            self.static_sh_mask_logit = optimizable_tensors["static_sh_mask_logit"]
         
 
     def cat_tensors_to_optimizer(self, tensors_dict):
@@ -727,8 +767,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_dynamic_mask_logit=None):
-        old_dyn_num = self._xyz.shape[0]
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_dynamic_mask_logit = None, new_dynamic_sh_mask_logit = None):
 
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
@@ -744,11 +783,10 @@ class GaussianModel:
             if self.rot_4d:
                 d["rotation_r"] = new_rotation_r
 
-        if new_dynamic_mask_logit is not None:
+        if self.use_pruning and new_dynamic_mask_logit is not None:
             group_names = [group["name"] for group in self.optimizer.param_groups]
 
             if "dynamic_mask_logit" not in group_names:
-                # 第一次出现动态 mask：手动建参数并加入优化器
                 self.dynamic_mask_logit = nn.Parameter(new_dynamic_mask_logit.requires_grad_(True))
                 self.optimizer.add_param_group({
                     'params': [self.dynamic_mask_logit],
@@ -756,8 +794,20 @@ class GaussianModel:
                     "name": "dynamic_mask_logit"
                 })
             else:
-                # 已经有动态 mask 参数组：交给 cat_tensors_to_optimizer 统一拼接
                 d["dynamic_mask_logit"] = new_dynamic_mask_logit
+        
+        if self.use_sh_adaptive and new_dynamic_sh_mask_logit is not None:
+            group_names = [group["name"] for group in self.optimizer.param_groups]
+
+            if "dynamic_sh_mask_logit" not in group_names:
+                self.dynamic_sh_mask_logit = nn.Parameter(new_dynamic_sh_mask_logit.requires_grad_(True))
+                self.optimizer.add_param_group({
+                    'params': [self.dynamic_sh_mask_logit],
+                    'lr': self.sh_mask_lr,
+                    "name": "dynamic_sh_mask_logit"
+                })
+            else:
+                d["dynamic_sh_mask_logit"] = new_dynamic_sh_mask_logit
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -769,6 +819,9 @@ class GaussianModel:
 
         if "dynamic_mask_logit" in optimizable_tensors:
             self.dynamic_mask_logit = optimizable_tensors["dynamic_mask_logit"]
+
+        if "dynamic_sh_mask_logit" in optimizable_tensors:
+            self.dynamic_sh_mask_logit = optimizable_tensors["dynamic_sh_mask_logit"]
 
         if self.gaussian_dim == 4:
             self._t = optimizable_tensors['t']
@@ -786,7 +839,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densification_postfix_static(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_static_mask_logit=None):
+    def densification_postfix_static(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_static_mask_logit = None, new_static_sh_mask_logit = None):
         d = {"static_xyz": new_xyz,
         "static_f_dc": new_features_dc,
         "static_f_rest": new_features_rest,
@@ -795,12 +848,9 @@ class GaussianModel:
         "static_rotation" : new_rotation,
         }
 
-        if new_static_mask_logit is not None:
-            # 检查当前优化器参数组中是否已经存在 static_mask_logit
-            group_names = [group["name"] for group in self.optimizer.param_groups]
-            
+        if self.use_pruning and new_static_mask_logit is not None:
+            group_names = [group["name"] for group in self.optimizer.param_groups]          
             if "static_mask_logit" not in group_names:
-                # 如果不存在（说明是第一次产生静态点），手动创建一个参数并加入优化器
                 self.static_mask_logit = nn.Parameter(new_static_mask_logit.requires_grad_(True))
                 self.optimizer.add_param_group({
                     'params': [self.static_mask_logit], 
@@ -808,8 +858,19 @@ class GaussianModel:
                     "name": "static_mask_logit"
                 })
             else:
-                # 如果已经存在，则放入字典，由 cat_tensors_to_optimizer 处理拼接逻辑
                 d["static_mask_logit"] = new_static_mask_logit
+        
+        if self.use_sh_adaptive and new_static_sh_mask_logit is not None:
+            group_names = [group["name"] for group in self.optimizer.param_groups]          
+            if "static_sh_mask_logit" not in group_names:
+                self.static_sh_mask_logit = nn.Parameter(new_static_sh_mask_logit.requires_grad_(True))
+                self.optimizer.add_param_group({
+                    'params': [self.static_sh_mask_logit], 
+                    'lr': self.sh_mask_lr, 
+                    "name": "static_sh_mask_logit"
+                })
+            else:
+                d["static_sh_mask_logit"] = new_static_sh_mask_logit
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)      
         self.static_xyz = optimizable_tensors["static_xyz"]
@@ -821,6 +882,9 @@ class GaussianModel:
     
         if "static_mask_logit" in optimizable_tensors:
             self.static_mask_logit = optimizable_tensors["static_mask_logit"]
+
+        if "static_sh_mask_logit" in optimizable_tensors:
+            self.static_sh_mask_logit = optimizable_tensors["static_sh_mask_logit"]
 
         self.static_max_radii2D = torch.zeros((self.static_xyz.shape[0]), device="cuda")
         self.static_denom = torch.zeros((self.static_xyz.shape[0], 1), device="cuda")
@@ -871,15 +935,24 @@ class GaussianModel:
             new_rotation_r = self._rotation_r[selected_pts_mask].repeat(N,1)
 
         new_dynamic_mask_logit = None
-        if hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit.numel() > 0:
-            new_dynamic_mask_logit = self.dynamic_mask_logit[selected_pts_mask]
-            if N > 1:
-                new_dynamic_mask_logit = new_dynamic_mask_logit.repeat(N, 1)
-        else:
-            # 如果还没有 dynamic mask，就给新点一个高保留初值
-            new_dynamic_mask_logit = torch.full((N * selected_pts_mask.sum(), 1), 0.0, device="cuda")
+        if self.use_pruning:
+            if hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit.numel() > 0:
+                new_dynamic_mask_logit = self.dynamic_mask_logit[selected_pts_mask]
+                if N > 1:
+                    new_dynamic_mask_logit = new_dynamic_mask_logit.repeat(N, 1)
+            else:
+                new_dynamic_mask_logit = torch.full((N * selected_pts_mask.sum(), 1), 0.0, device="cuda")
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_dynamic_mask_logit)
+        new_dynaminc_sh_mask_logit = None
+        if self.use_sh_adaptive:
+            if hasattr(self, "dynamic_sh_mask_logit") and self.dynamic_sh_mask_logit.numel() > 0:
+                new_dynaminc_sh_mask_logit = self.dynamic_sh_mask_logit[selected_pts_mask]
+                if N > 1:
+                    new_dynaminc_sh_mask_logit = new_dynaminc_sh_mask_logit.repeat(N, 1)
+            else:            
+                new_dynaminc_sh_mask_logit = torch.full((N * selected_pts_mask.sum(), 3), 0.0, device="cuda")
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_dynamic_mask_logit, new_dynaminc_sh_mask_logit)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -909,12 +982,20 @@ class GaussianModel:
                 new_rotation_r = self._rotation_r[selected_pts_mask]
 
         new_dynamic_mask_logit = None
-        if hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit.numel() > 0:
-            new_dynamic_mask_logit = self.dynamic_mask_logit[selected_pts_mask]
-        else:
-            new_dynamic_mask_logit = torch.full((selected_pts_mask.sum(), 1), 0.0, device="cuda") #0.5
+        if self.use_pruning:
+            if hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit.numel() > 0:
+                new_dynamic_mask_logit = self.dynamic_mask_logit[selected_pts_mask]
+            else:
+                new_dynamic_mask_logit = torch.full((selected_pts_mask.sum(), 1), 0.0, device="cuda") #0.5
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_dynamic_mask_logit)
+        new_dynamic_sh_mask_logit = None
+        if self.use_sh_adaptive:
+            if hasattr(self, "dynamic_sh_mask_logit") and self.dynamic_sh_mask_logit.numel() > 0:
+                new_dynamic_sh_mask_logit = self.dynamic_sh_mask_logit[selected_pts_mask]
+            else:            
+                new_dynamic_sh_mask_logit = torch.full((selected_pts_mask.sum(), 3), 0.0, device="cuda") #0.5
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_dynamic_mask_logit, new_dynamic_sh_mask_logit)
 
     def densify_and_split_static(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_static_xyz.shape[0]
@@ -938,14 +1019,24 @@ class GaussianModel:
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_static_xyz[selected_pts_mask].repeat(N, 1)
 
         new_mask_logit = None
-        if hasattr(self, "static_mask_logit") and self.static_mask_logit.numel() > 0:
-            new_mask_logit = self.static_mask_logit[selected_pts_mask]
-            if N > 1:
-                new_mask_logit = new_mask_logit.repeat(N, 1)
-        else:
-            new_mask_logit = torch.full((N * selected_pts_mask.sum(), 1), 0.0, device="cuda")#0.5
+        if self.use_pruning:
+            if hasattr(self, "static_mask_logit") and self.static_mask_logit.numel() > 0:
+                new_mask_logit = self.static_mask_logit[selected_pts_mask]
+                if N > 1:
+                    new_mask_logit = new_mask_logit.repeat(N, 1)
+            else:
+                new_mask_logit = torch.full((N * selected_pts_mask.sum(), 1), 0.0, device="cuda")#0.5
+
+        new_static_sh_mask_logit = None
+        if self.use_sh_adaptive:
+            if hasattr(self, "static_sh_mask_logit") and self.static_sh_mask_logit.numel() > 0:
+                new_static_sh_mask_logit = self.static_sh_mask_logit[selected_pts_mask]
+                if N > 1:
+                    new_static_sh_mask_logit = new_static_sh_mask_logit.repeat(N, 1)
+            else:            
+                new_static_sh_mask_logit = torch.full((N * selected_pts_mask.sum(), 3), 0.0, device="cuda")#0.5
         
-        self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_mask_logit)
+        self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_mask_logit, new_static_sh_mask_logit)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_static_points(prune_filter)
@@ -964,11 +1055,20 @@ class GaussianModel:
         new_rotation = self.static_rotation[selected_pts_mask]
 
         new_mask_logit = None
-        if hasattr(self, "static_mask_logit") and self.static_mask_logit.numel() > 0:
-            new_mask_logit = self.static_mask_logit[selected_pts_mask]
-        else:
-            new_mask_logit = torch.full((selected_pts_mask.sum(), 1), 0.0, device="cuda") #0.5
-        self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_mask_logit)
+        if self.use_pruning:
+            if hasattr(self, "static_mask_logit") and self.static_mask_logit.numel() > 0:
+                new_mask_logit = self.static_mask_logit[selected_pts_mask]
+            else:
+                new_mask_logit = torch.full((selected_pts_mask.sum(), 1), 0.0, device="cuda") #0.5
+
+        new_static_sh_mask_logit = None
+        if self.use_sh_adaptive:
+            if hasattr(self, "static_sh_mask_logit") and self.static_sh_mask_logit.numel() > 0:
+                new_static_sh_mask_logit = self.static_sh_mask_logit[selected_pts_mask]
+            else:            
+                new_static_sh_mask_logit = torch.full((selected_pts_mask.sum(), 3), 0.0, device="cuda") #0.5
+        
+        self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_mask_logit, new_static_sh_mask_logit)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, max_grad_t=None, prune_only=False, dynamic_only=False):
         if not prune_only:
@@ -1058,32 +1158,32 @@ class GaussianModel:
         new_rotation = rotation_matrix_to_rotation_3d(r_3d)
         new_scaling = self._scaling[static_mask]
 
-        new_static_mask_logit = torch.full((static_mask.sum(), 1), 0.0, device="cuda") #0.5
+        new_static_mask_logit = None
+        if self.use_pruning:
+            new_static_mask_logit = torch.full((static_mask.sum(), 1), 0.0, device="cuda")
+
+        new_static_sh_mask_logit = None
+        if self.use_sh_adaptive:
+            new_static_sh_mask_logit = torch.full((static_mask.sum(), 3), 0.0, device="cuda")
 
         self.prune_points(static_mask)
 
-        self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_static_mask_logit)
+        self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_static_mask_logit, new_static_sh_mask_logit)
 
     def prune_low_mask_points(self, threshold=0.1):
         """
         对静态点进行硬剪枝（只剪静态 3D 池）
         """
-        if (hasattr(self, "static_mask_logit") and self.static_mask_logit is not None and self.static_mask_logit.numel() > 0 and hasattr(self, "static_xyz") and self.static_xyz.shape[0] > 0):
-            # soft mask
+        if self.use_pruning and (hasattr(self, "static_mask_logit") and self.static_mask_logit is not None and self.static_mask_logit.numel() > 0 and hasattr(self, "static_xyz") and self.static_xyz.shape[0] > 0):
             sm = torch.sigmoid(self.static_mask_logit)
-
-            # keep mask
             keep_static_mask = (sm > threshold).squeeze()
             if keep_static_mask.dim() == 0:
                 keep_static_mask = keep_static_mask.unsqueeze(0)
-
-            # 真正剪掉低于阈值的静态点
             if not keep_static_mask.all():
                 prune_static_mask = ~keep_static_mask
                 self.prune_static_points(prune_static_mask)
-
-        # 兜底：对齐 static_mask_logit 长度到当前静态池
-        if hasattr(self, "static_mask_logit") and hasattr(self, "static_xyz"):
+        
+        if self.use_pruning and hasattr(self, "static_mask_logit") and hasattr(self, "static_xyz"):
             new_static = self.static_xyz.shape[0]
 
             if self.static_mask_logit.numel() == 0 and new_static > 0:
@@ -1097,27 +1197,38 @@ class GaussianModel:
                     self.static_mask_logit = nn.Parameter(torch.cat([self.static_mask_logit, pad], dim=0))
                 else:
                     self.static_mask_logit = nn.Parameter(self.static_mask_logit[:new_static])
+        
+        if self.use_sh_adaptive and hasattr(self, "static_sh_mask_logit") and hasattr(self, "static_xyz"):
+            new_static = self.static_xyz.shape[0]
+
+            if self.static_sh_mask_logit.numel() == 0 and new_static > 0:
+                pad = torch.full((new_static, 3), 0.0, device="cuda")
+                self.static_sh_mask_logit = nn.Parameter(pad)
+
+            elif self.static_sh_mask_logit.shape[0] != new_static:
+                diff = new_static - self.static_sh_mask_logit.shape[0]
+                if diff > 0:
+                    pad = torch.full((diff, 3), 0.0, device="cuda", dtype=self.static_sh_mask_logit.dtype)
+                    self.static_sh_mask_logit = nn.Parameter(torch.cat([self.static_sh_mask_logit, pad], dim=0))
+                else:
+                    self.static_sh_mask_logit = nn.Parameter(self.static_sh_mask_logit[:new_static])
+
     
     def prune_low_dynamic_mask_points(self, threshold=0.1):
         """
         对动态点进行硬剪枝（只剪动态 4D 池）
         """
-        if (hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit is not None and self.dynamic_mask_logit.numel() > 0 and hasattr(self, "_xyz") and self._xyz.shape[0] > 0):
-            # soft mask
+        if self.use_pruning and (hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit is not None and self.dynamic_mask_logit.numel() > 0 and hasattr(self, "_xyz") and self._xyz.shape[0] > 0):
             dm = torch.sigmoid(self.dynamic_mask_logit)
-
-            # keep mask
             keep_dynamic_mask = (dm > threshold).squeeze()
             if keep_dynamic_mask.dim() == 0:
                 keep_dynamic_mask = keep_dynamic_mask.unsqueeze(0)
 
-            # 真正剪掉低于阈值的动态点
             if not keep_dynamic_mask.all():
                 prune_dynamic_mask = ~keep_dynamic_mask
                 self.prune_points(prune_dynamic_mask)
 
-        # 兜底：对齐 dynamic_mask_logit 长度到当前动态池
-        if hasattr(self, "dynamic_mask_logit") and hasattr(self, "_xyz"):
+        if self.use_pruning and hasattr(self, "dynamic_mask_logit") and hasattr(self, "_xyz"):
             new_dynamic = self._xyz.shape[0]
 
             if self.dynamic_mask_logit.numel() == 0 and new_dynamic > 0:
@@ -1131,3 +1242,307 @@ class GaussianModel:
                     self.dynamic_mask_logit = nn.Parameter(torch.cat([self.dynamic_mask_logit, pad], dim=0))
                 else:
                     self.dynamic_mask_logit = nn.Parameter(self.dynamic_mask_logit[:new_dynamic])
+        
+        if self.use_sh_adaptive and hasattr(self, "dynamic_sh_mask_logit") and hasattr(self, "_xyz"):
+            new_dynamic = self._xyz.shape[0]
+
+            if self.dynamic_sh_mask_logit.numel() == 0 and new_dynamic > 0:
+                pad = torch.full((new_dynamic, 3), 0.0, device="cuda")
+                self.dynamic_sh_mask_logit = nn.Parameter(pad)
+
+            elif self.dynamic_sh_mask_logit.shape[0] != new_dynamic:
+                diff = new_dynamic - self.dynamic_sh_mask_logit.shape[0]
+                if diff > 0:
+                    pad = torch.full((diff, 3), 0.0, device="cuda", dtype=self.dynamic_sh_mask_logit.dtype)
+                    self.dynamic_sh_mask_logit = nn.Parameter(torch.cat([self.dynamic_sh_mask_logit, pad], dim=0))
+                else:
+                    self.dynamic_sh_mask_logit = nn.Parameter(self.dynamic_sh_mask_logit[:new_dynamic])
+
+    @torch.no_grad()
+    def hard_prune_sh(self, threshold=0.1):
+        """
+        Independent hard prune for SH coefficients.
+        Keep tensor shape unchanged.
+        Only zero corresponding SH bands independently.
+        """
+
+        def prune_branch(features_rest, sh_mask_logit, branch_name="dynamic"):
+            if features_rest is None or features_rest.numel() == 0:
+                return features_rest
+
+            if sh_mask_logit is None or sh_mask_logit.numel() == 0:
+                print(f"[{branch_name}] No SH mask found, skip.")
+                return features_rest
+
+            soft_sh = torch.sigmoid(sh_mask_logit)
+
+            # independent gating
+            m1 = (soft_sh[:, 0] > threshold).to(features_rest.dtype)[:, None, None]  # l=1
+            m2 = (soft_sh[:, 1] > threshold).to(features_rest.dtype)[:, None, None]  # l=2
+            m3 = (soft_sh[:, 2] > threshold).to(features_rest.dtype)[:, None, None]  # l=3
+
+            spatial_rest = features_rest[:, :15, :].clone()
+
+            spatial_rest[:, 0:3,  :] *= m1   # l=1
+            spatial_rest[:, 3:8,  :] *= m2   # l=2
+            spatial_rest[:, 8:15, :] *= m3   # l=3
+
+            if features_rest.shape[1] > 15:
+                tail = features_rest[:, 15:, :].clone()
+                features_rest = torch.cat([spatial_rest, tail], dim=1)
+            else:
+                features_rest = spatial_rest
+            return features_rest
+
+        if hasattr(self, "_features_rest"):
+            self._features_rest = prune_branch(
+                self._features_rest,
+                getattr(self, "dynamic_sh_mask_logit", None),
+                "dynamic"
+            )
+
+        if hasattr(self, "static_features_rest"):
+            self.static_features_rest = prune_branch(
+                self.static_features_rest,
+                getattr(self, "static_sh_mask_logit", None),
+                "static"
+            )
+
+    @torch.no_grad()
+    def compute_model_size(
+        self,
+        include_dynamic=True,
+        include_static=True,
+        include_temporal=True,
+        include_masks=False,
+        include_sh_mask_logits=False,
+        include_env_map=False,
+        include_training_stats=False,
+        count_mode="dense",              # "dense" or "effective"
+        phi_threshold_dynamic=None,      # e.g. 0.1
+        phi_threshold_static=None,       # e.g. 0.1
+        sh_threshold=None,               # e.g. 0.1
+        override_dtype_bytes=None,       # None -> use tensor.element_size(); 2 -> fp16; 4 -> fp32
+        verbose=False,
+    ):
+        """
+        统计模型大小（默认不含 optimizer state）。
+
+        两种模式：
+        1) dense:
+        - 按当前 tensor shape 直接统计
+        - 适合原始 checkpoint / 原始 dense 存储大小
+
+        2) effective:
+        - 可结合 phi_threshold_* 和 sh_threshold，只统计“有效”参数
+        - 适合做 RDO / ablation 的 rate 估计
+        - 注意：SH hard prune 只置零不改 shape，因此 dense 模式下 SH 不会变小，effective 模式才会体现 SH 压缩收益
+        """
+        assert count_mode in ["dense", "effective"]
+
+        def _is_valid_tensor(x):
+            return torch.is_tensor(x) and x is not None and x.numel() > 0
+
+        def _elem_bytes(x):
+            if override_dtype_bytes is not None:
+                return int(override_dtype_bytes)
+            return int(x.element_size())
+
+        def _tensor_bytes(x, row_mask=None):
+            if not _is_valid_tensor(x):
+                return 0
+            t = x.detach()
+            if row_mask is not None:
+                if t.shape[0] != row_mask.shape[0]:
+                    raise ValueError(
+                        f"Row mask shape mismatch: tensor first dim = {t.shape[0]}, mask = {row_mask.shape[0]}"
+                    )
+                t = t[row_mask]
+            return int(t.numel()) * _elem_bytes(t)
+
+        def _make_keep_mask(mask_logit, num_points, threshold, device):
+            keep = torch.ones(num_points, dtype=torch.bool, device=device)
+            if threshold is None:
+                return keep
+            if _is_valid_tensor(mask_logit) and mask_logit.shape[0] == num_points:
+                soft = torch.sigmoid(mask_logit.detach()).view(-1)
+                keep = soft > threshold
+            return keep
+
+        def _features_rest_bytes(features_rest, sh_mask_logit=None, point_keep_mask=None, sh_thr=None):
+            """
+            对 features_rest 做两种统计：
+            - dense: 直接按 tensor shape 计
+            - effective:
+                * 若不给 sh_thr：仍按保留下来的点的 dense shape 计
+                * 若给 sh_thr：只统计有效 SH bands（l1/l2/l3）+ tail
+            """
+            if not _is_valid_tensor(features_rest):
+                return 0
+
+            t = features_rest.detach()
+            if point_keep_mask is not None:
+                t = t[point_keep_mask]
+
+            if count_mode == "dense" or sh_thr is None:
+                return int(t.numel()) * _elem_bytes(t)
+
+            # effective 模式下，按 SH band 实际有效通道数计算
+            # 约定前 15 个通道对应 spatial SH 的 l1/l2/l3: 3 / 5 / 7
+            # 这和你 hard_prune_sh() / apply_sh_masks() 的写法一致
+            if t.numel() == 0:
+                return 0
+
+            n_pts = t.shape[0]
+            n_ch = t.shape[1]
+            n_rgb = t.shape[2]
+            bytes_per_elem = _elem_bytes(t)
+
+            if not _is_valid_tensor(sh_mask_logit):
+                return int(t.numel()) * bytes_per_elem
+
+            sh = sh_mask_logit.detach()
+            if point_keep_mask is not None:
+                sh = sh[point_keep_mask]
+
+            if sh.shape[0] != n_pts:
+                return int(t.numel()) * bytes_per_elem
+
+            # 前 15 个 spatial channels
+            spatial_ch = min(n_ch, 15)
+            tail_ch = max(n_ch - 15, 0)
+
+            # m1/m2/m3: [N]
+            m1 = (torch.sigmoid(sh[:, 0]) > sh_thr)
+            m2 = (torch.sigmoid(sh[:, 1]) > sh_thr)
+            m3 = (torch.sigmoid(sh[:, 2]) > sh_thr)
+
+            # l1/l2/l3 分别占 3/5/7 个通道
+            kept_spatial_ch = 0
+            if spatial_ch > 0:
+                # 只在前 15 通道范围内计数
+                ch_l1 = min(max(spatial_ch - 0, 0), 3)
+                ch_l2 = min(max(spatial_ch - 3, 0), 5)
+                ch_l3 = min(max(spatial_ch - 8, 0), 7)
+
+                kept_spatial_ch += int(m1.sum().item()) * ch_l1
+                kept_spatial_ch += int(m2.sum().item()) * ch_l2
+                kept_spatial_ch += int(m3.sum().item()) * ch_l3
+
+            kept_tail_ch = tail_ch * n_pts
+            kept_total_values = (kept_spatial_ch + kept_tail_ch) * n_rgb
+            return int(kept_total_values) * bytes_per_elem
+
+        breakdown = {}
+        total_bytes = 0
+
+        # ---------------- Dynamic keep mask ----------------
+        dyn_keep = None
+        if include_dynamic and _is_valid_tensor(self._xyz):
+            dyn_keep = _make_keep_mask(
+                getattr(self, "dynamic_mask_logit", None),
+                self._xyz.shape[0],
+                phi_threshold_dynamic if count_mode == "effective" else None,
+                self._xyz.device,
+            )
+
+        # ---------------- Static keep mask ----------------
+        sta_keep = None
+        if include_static and _is_valid_tensor(self.static_xyz):
+            sta_keep = _make_keep_mask(
+                getattr(self, "static_mask_logit", None),
+                self.static_xyz.shape[0],
+                phi_threshold_static if count_mode == "effective" else None,
+                self.static_xyz.device,
+            )
+
+        # ---------------- Dynamic branch ----------------
+        if include_dynamic:
+            breakdown["dynamic_xyz"] = _tensor_bytes(getattr(self, "_xyz", None), dyn_keep)
+            breakdown["dynamic_features_dc"] = _tensor_bytes(getattr(self, "_features_dc", None), dyn_keep)
+            breakdown["dynamic_features_rest"] = _features_rest_bytes(
+                getattr(self, "_features_rest", None),
+                getattr(self, "dynamic_sh_mask_logit", None),
+                dyn_keep,
+                sh_threshold if count_mode == "effective" else None,
+            )
+            breakdown["dynamic_opacity"] = _tensor_bytes(getattr(self, "_opacity", None), dyn_keep)
+            breakdown["dynamic_scaling"] = _tensor_bytes(getattr(self, "_scaling", None), dyn_keep)
+            breakdown["dynamic_rotation"] = _tensor_bytes(getattr(self, "_rotation", None), dyn_keep)
+
+            if include_temporal and self.gaussian_dim == 4:
+                breakdown["dynamic_t"] = _tensor_bytes(getattr(self, "_t", None), dyn_keep)
+                breakdown["dynamic_scaling_t"] = _tensor_bytes(getattr(self, "_scaling_t", None), dyn_keep)
+                breakdown["dynamic_rotation_r"] = _tensor_bytes(
+                    getattr(self, "_rotation_r", None), dyn_keep if self.rot_4d else None
+                )
+
+        # ---------------- Static branch ----------------
+        if include_static:
+            breakdown["static_xyz"] = _tensor_bytes(getattr(self, "static_xyz", None), sta_keep)
+            breakdown["static_features_dc"] = _tensor_bytes(getattr(self, "static_features_dc", None), sta_keep)
+            breakdown["static_features_rest"] = _features_rest_bytes(
+                getattr(self, "static_features_rest", None),
+                getattr(self, "static_sh_mask_logit", None),
+                sta_keep,
+                sh_threshold if count_mode == "effective" else None,
+            )
+            breakdown["static_opacity"] = _tensor_bytes(getattr(self, "static_opacity", None), sta_keep)
+            breakdown["static_scaling"] = _tensor_bytes(getattr(self, "static_scaling", None), sta_keep)
+            breakdown["static_rotation"] = _tensor_bytes(getattr(self, "static_rotation", None), sta_keep)
+
+        # ---------------- Mask logits ----------------
+        if include_masks:
+            breakdown["dynamic_mask_logit"] = _tensor_bytes(getattr(self, "dynamic_mask_logit", None))
+            breakdown["static_mask_logit"] = _tensor_bytes(getattr(self, "static_mask_logit", None))
+
+        if include_sh_mask_logits:
+            breakdown["dynamic_sh_mask_logit"] = _tensor_bytes(getattr(self, "dynamic_sh_mask_logit", None))
+            breakdown["static_sh_mask_logit"] = _tensor_bytes(getattr(self, "static_sh_mask_logit", None))
+
+        # ---------------- Env map ----------------
+        if include_env_map:
+            breakdown["env_map"] = _tensor_bytes(getattr(self, "env_map", None))
+
+        # ---------------- Training-only statistics ----------------
+        if include_training_stats:
+            breakdown["xyz_gradient_accum"] = _tensor_bytes(getattr(self, "xyz_gradient_accum", None))
+            breakdown["denom"] = _tensor_bytes(getattr(self, "denom", None))
+            breakdown["max_radii2D"] = _tensor_bytes(getattr(self, "max_radii2D", None))
+            breakdown["t_gradient_accum"] = _tensor_bytes(getattr(self, "t_gradient_accum", None))
+            breakdown["dynamic_vis_denom"] = _tensor_bytes(getattr(self, "dynamic_vis_denom", None))
+            breakdown["dynamic_alpha_accum"] = _tensor_bytes(getattr(self, "dynamic_alpha_accum", None))
+            breakdown["dynamic_motion_accum"] = _tensor_bytes(getattr(self, "dynamic_motion_accum", None))
+            breakdown["dynamic_time_support_accum"] = _tensor_bytes(getattr(self, "dynamic_time_support_accum", None))
+            breakdown["static_max_radii2D"] = _tensor_bytes(getattr(self, "static_max_radii2D", None))
+            breakdown["static_xyz_gradient_accum"] = _tensor_bytes(getattr(self, "static_xyz_gradient_accum", None))
+            breakdown["static_denom"] = _tensor_bytes(getattr(self, "static_denom", None))
+
+        total_bytes = sum(breakdown.values())
+        total_mb = total_bytes / 1024.0 / 1024.0
+
+        result = {
+            "total_bytes": int(total_bytes),
+            "total_mb": float(total_mb),
+            "breakdown_bytes": breakdown,
+            "breakdown_mb": {k: v / 1024.0 / 1024.0 for k, v in breakdown.items()},
+            "num_dynamic_points": int(self._xyz.shape[0]) if _is_valid_tensor(getattr(self, "_xyz", None)) else 0,
+            "num_static_points": int(self.static_xyz.shape[0]) if _is_valid_tensor(getattr(self, "static_xyz", None)) else 0,
+            "num_dynamic_kept": int(dyn_keep.sum().item()) if dyn_keep is not None else 0,
+            "num_static_kept": int(sta_keep.sum().item()) if sta_keep is not None else 0,
+            "count_mode": count_mode,
+        }
+
+        if verbose:
+            print("\n================ Model Size ================")
+            print(f"count_mode      : {count_mode}")
+            print(f"total_bytes     : {result['total_bytes']}")
+            print(f"total_mb        : {result['total_mb']:.4f} MB")
+            print(f"dynamic kept    : {result['num_dynamic_kept']} / {result['num_dynamic_points']}")
+            print(f"static kept     : {result['num_static_kept']} / {result['num_static_points']}")
+            for k, v in result["breakdown_mb"].items():
+                if v > 0:
+                    print(f"{k:24s}: {v:.4f} MB")
+            print("===========================================\n")
+
+        return result

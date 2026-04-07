@@ -22,39 +22,35 @@ def get_ste_mask(mask_logit, threshold=0.1):
     hard_mask = STEFunction.apply(soft_mask, threshold)
     return soft_mask + (hard_mask - soft_mask).detach()
 
-def get_sh_masks(sh_logits, threshold=0.5):
+def get_sh_masks(sh_logits, threshold=0.1):
     """
-    计算自适应 SH 级联掩码
+    计算 SH 自适应剪枝掩码
     """
-    soft_sh = torch.sigmoid(sh_logits)
-    m1 = STEFunction.apply(soft_sh[:, 0:1], threshold)
-    m2 = STEFunction.apply(soft_sh[:, 1:2], threshold)
-    m3 = STEFunction.apply(soft_sh[:, 2:3], threshold)
-    
-    # 级联依赖：1阶关了，2、3阶必须关
-    eff_m1 = m1
-    eff_m2 = m1 * m2
-    eff_m3 = m1 * m2 * m3
-    
-    hard_masks = torch.cat([eff_m1, eff_m2, eff_m3], dim=-1)
-    return soft_sh + (hard_masks - soft_sh).detach()
+    soft_sh = torch.sigmoid(sh_logits)                      # [N, 3]
+    hard_sh = STEFunction.apply(soft_sh, threshold)         # [N, 3]
+
+    return soft_sh + (hard_sh - soft_sh).detach()
 
 def apply_sh_masks(shs, masks):
     """
-    将掩码应用到球谐函数系数上
-    shs 形状: [N, 16, 3] (1个DC + 15个额外SH系数)
-    masks 形状: [N, 3] (对应 1, 2, 3 阶的级联硬掩码)
+    独立掩码应用到SH:
+    DC 不动
+    l=1 -> 1:4
+    l=2 -> 4:9
+    l=3 -> 9:16
+
+    如果后面还有额外通道，保留 tail，不要截断。
     """
-    # 这里的 shs 是特征向量，通常索引 0 是 DC，1-15 是 SH
-    # 保持 DC 不变，只对高阶项做掩码
-    
-    # 第1阶: 包含 3 个系数 (索引 1, 2, 3)
-    shs[:, 1:4, :] = shs[:, 1:4, :] * masks[:, 0:1].unsqueeze(-1)
-    
-    # 第2阶: 包含 5 个系数 (索引 4, 5, 6, 7, 8)
-    shs[:, 4:9, :] = shs[:, 4:9, :] * masks[:, 1:2].unsqueeze(-1)
-    
-    # 第3阶: 包含 7 个系数 (索引 9, 10, 11, 12, 13, 14, 15)
-    shs[:, 9:16, :] = shs[:, 9:16, :] * masks[:, 2:3].unsqueeze(-1)
-    
-    return shs
+    assert shs.shape[1] >= 16, f"Expected >=16 SH channels, got {shs.shape[1]}"
+
+    sh0 = shs[:, 0:1, :]
+    sh1 = shs[:, 1:4, :] * masks[:, 0:1].unsqueeze(-1)
+    sh2 = shs[:, 4:9, :] * masks[:, 1:2].unsqueeze(-1)
+    sh3 = shs[:, 9:16, :] * masks[:, 2:3].unsqueeze(-1)
+
+    tail = shs[:, 16:, :] if shs.shape[1] > 16 else None
+
+    if tail is not None:
+        return torch.cat([sh0, sh1, sh2, sh3, tail], dim=1)
+    else:
+        return torch.cat([sh0, sh1, sh2, sh3], dim=1)

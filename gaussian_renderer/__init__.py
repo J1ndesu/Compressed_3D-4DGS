@@ -16,7 +16,7 @@ from .diff_gaussian_rasterization import GaussianRasterizationSettings, Gaussian
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh, eval_shfs_4d
 from collections import defaultdict
-from utils.compression_utils import get_ste_mask
+from utils.compression_utils import get_ste_mask, get_sh_masks, apply_sh_masks
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
@@ -64,7 +64,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means2D = screenspace_points
     opacity = pc.get_opacity
 
-    if hasattr(pc, "dynamic_mask_logit") and getattr(pc, "dynamic_mask_logit") is not None:
+    if getattr(pc, "use_pruning", False) and hasattr(pc, "dynamic_mask_logit") and getattr(pc, "dynamic_mask_logit") is not None and pc.dynamic_mask_logit.numel() > 0:
         dm_raw = pc.dynamic_mask_logit
         if dm_raw.numel() == 0 or dm_raw.shape[0] != means3D.shape[0]:
             dm = torch.ones((means3D.shape[0], 1), device=opacity.device, dtype=opacity.dtype)
@@ -107,14 +107,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     shs = None
     colors_precomp = None
     if override_color is None:
+        raw_shs = pc.get_features
+        if getattr(pc, "enable_sh_mask", False) and getattr(pc, "use_sh_adaptive", False) and hasattr(pc, 'dynamic_sh_mask_logit') and pc.dynamic_sh_mask_logit is not None and pc.dynamic_sh_mask_logit.numel() > 0:
+            sh_hard_masks = get_sh_masks(pc.dynamic_sh_mask_logit)
+            raw_shs = apply_sh_masks(raw_shs, sh_hard_masks)
+
         if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, pc.get_max_sh_channels)
+            shs_view = raw_shs.transpose(1, 2).contiguous().view(-1, 3, raw_shs.shape[1])
             if pipe.compute_cov3D_python:
-                dir_pp = (means3D - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1)).detach()
+                dir_pp = (means3D - viewpoint_camera.camera_center.repeat(raw_shs.shape[0], 1)).detach()
             else:
-                _, delta_mean = pc.get_current_covariance_and_mean_offset(scaling_modifier, viewpoint_camera.timestamp)
-                dir_pp = ((means3D + delta_mean) - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1)).detach()
-            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+                _, delta_mean = pc.get_current_covariance_and_mean_offset(
+                    scaling_modifier, viewpoint_camera.timestamp
+                )
+                dir_pp = ((means3D + delta_mean) - viewpoint_camera.camera_center.repeat(raw_shs.shape[0], 1)).detach()
+
+            dir_pp_normalized = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + 1e-8)
             if pc.gaussian_dim == 3 or pc.force_sh_3d:
                 sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             elif pc.gaussian_dim == 4:
@@ -122,7 +130,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 sh2rgb = eval_shfs_4d(pc.active_sh_degree, pc.active_sh_degree_t, shs_view, dir_pp_normalized, dir_t, pc.time_duration[1] - pc.time_duration[0])
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
-            shs = pc.get_features
+            shs = raw_shs
             if pc.gaussian_dim == 4 and ts is None:
                 ts = pc.get_t
     else:
@@ -172,7 +180,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     scales_static = pc.get_static_scaling
     rotations_static = pc.get_static_rotation
 
-    if hasattr(pc, "static_mask_logit") and getattr(pc, "static_mask_logit") is not None:
+    if getattr(pc, "use_pruning", False) and hasattr(pc, "static_mask_logit") and getattr(pc, "static_mask_logit") is not None and pc.static_mask_logit.numel() > 0:
         sm_raw = pc.static_mask_logit
         if sm_raw.numel() == 0 or sm_raw.shape[0] != means3D_static.shape[0]:
             sm = torch.ones((means3D_static.shape[0], 1), device=opacity_static.device, dtype=opacity_static.dtype)
@@ -183,6 +191,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             sm = sm.to(opacity_static.dtype).to(opacity_static.device)
 
         opacity_static = opacity_static * sm
+
+    if getattr(pc, "enable_sh_mask", False) and getattr(pc, "use_sh_adaptive", False) and hasattr(pc, 'static_sh_mask_logit') and pc.static_sh_mask_logit is not None and pc.static_sh_mask_logit.numel() > 0:
+        sh_hard_masks_static = get_sh_masks(pc.static_sh_mask_logit)
+        sh_static = apply_sh_masks(sh_static, sh_hard_masks_static)
 
     rendered_image, radii, depth, alpha, flow, covs_com, radii_static, color_4d, color_3d, invdepth = rasterizer(
         means3D = means3D,

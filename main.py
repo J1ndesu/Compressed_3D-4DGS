@@ -56,49 +56,147 @@ def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4
     test_dir = os.path.join(dataset.model_path, 'test', "ours_{}".format(first_iter))
     gaussians.restore(model_params, None)
 
-    # ---------------- Phi Distribution ----------------
-    print("\n================ Phi Distribution ================\n")
-    thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    def _print_rest_param_stats(branch_name, features_rest, sh_mask_logit, threshold):
+        """
+        只统计 features_rest 的参数量（不含 DC）
+        当前只统计前 15 个 spatial SH rest 通道: l1=3, l2=5, l3=7
+        """
+        if features_rest is None or features_rest.numel() == 0:
+            return
+        if sh_mask_logit is None or sh_mask_logit.numel() == 0:
+            return
 
-    if hasattr(gaussians, "dynamic_mask_logit") and gaussians.dynamic_mask_logit is not None and gaussians.dynamic_mask_logit.numel() > 0:
-        phi_dyn = torch.sigmoid(gaussians.dynamic_mask_logit.detach()).view(-1).cpu()
-        print("Total dynamic gaussians:", phi_dyn.shape[0])
-        print("dynamic phi min :", phi_dyn.min().item())
-        print("dynamic phi max :", phi_dyn.max().item())
-        print("dynamic phi mean:", phi_dyn.mean().item())
-        print("dynamic phi std :", phi_dyn.std().item())
+        soft_sh = torch.sigmoid(sh_mask_logit.detach())
 
-        print("\nRatio below thresholds:")
-        for t in thresholds:
-            ratio = (phi_dyn < t).float().mean().item()
-            print(f"phi_dyn < {t:.1f} : {ratio*100:.2f}%")
+        r1 = (soft_sh[:, 0] > threshold).float().mean().item()
+        r2 = (soft_sh[:, 1] > threshold).float().mean().item()
+        r3 = (soft_sh[:, 2] > threshold).float().mean().item()
 
-    if hasattr(gaussians, "static_mask_logit") and gaussians.static_mask_logit is not None and gaussians.static_mask_logit.numel() > 0:
-        phi_sta = torch.sigmoid(gaussians.static_mask_logit.detach()).view(-1).cpu()
-        print("Total static gaussians:", phi_sta.shape[0])
-        print("phi min :", phi_sta.min().item())
-        print("phi max :", phi_sta.max().item())
-        print("phi mean:", phi_sta.mean().item())
-        print("phi std :", phi_sta.std().item())
+        n_pts = features_rest.shape[0]
+        rest_ch = min(features_rest.shape[1], 15)
+        bytes_per_elem = features_rest.element_size()
 
-        print("\nRatio below thresholds:")
-        for t in thresholds:
-            ratio = (phi_sta < t).float().mean().item()
-            print(f"phi < {t:.1f} : {ratio*100:.2f}%")
+        ch_l1 = min(max(rest_ch - 0, 0), 3)
+        ch_l2 = min(max(rest_ch - 3, 0), 5)
+        ch_l3 = min(max(rest_ch - 8, 0), 7)
 
+        dense_rest_params = n_pts * rest_ch * 3
+        kept_rest_params = n_pts * (ch_l1 * r1 + ch_l2 * r2 + ch_l3 * r3) * 3
+
+        dense_rest_mb = dense_rest_params * bytes_per_elem / 1024.0 / 1024.0
+        kept_rest_mb = kept_rest_params * bytes_per_elem / 1024.0 / 1024.0
+        kept_ratio = kept_rest_params / dense_rest_params if dense_rest_params > 0 else 1.0
+        compression_ratio = 1.0 - kept_ratio
+
+        print(f"\n[{branch_name} rest params]")
+        print(f"  dense rest params        : {dense_rest_params:.0f}")
+        print(f"  kept rest params         : {kept_rest_params:.0f}")
+        print(f"  dense rest size          : {dense_rest_mb:.4f} MB")
+        print(f"  kept rest size           : {kept_rest_mb:.4f} MB")
+        print(f"  rest kept ratio          : {kept_ratio*100:.2f}%")
+        print(f"  rest compression ratio   : {compression_ratio*100:.2f}%")
+
+    if getattr(opt, "use_pruning", False):
+        # ---------------- Phi Distribution ----------------
+        print("\n================ Phi Distribution ================\n")
+        thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+        if hasattr(gaussians, "dynamic_mask_logit") and gaussians.dynamic_mask_logit is not None and gaussians.dynamic_mask_logit.numel() > 0:
+            phi_dyn = torch.sigmoid(gaussians.dynamic_mask_logit.detach()).view(-1).cpu()
+            print("Total dynamic gaussians:", phi_dyn.shape[0])
+            print("dynamic phi min :", phi_dyn.min().item())
+            print("dynamic phi max :", phi_dyn.max().item())
+            print("dynamic phi mean:", phi_dyn.mean().item())
+            print("dynamic phi std :", phi_dyn.std().item())
+
+            print("\nRatio below thresholds:")
+            for t in thresholds:
+                ratio = (phi_dyn < t).float().mean().item()
+                print(f"phi_dyn < {t:.1f} : {ratio*100:.2f}%")
+
+        if hasattr(gaussians, "static_mask_logit") and gaussians.static_mask_logit is not None and gaussians.static_mask_logit.numel() > 0:
+            phi_sta = torch.sigmoid(gaussians.static_mask_logit.detach()).view(-1).cpu()
+            print("Total static gaussians:", phi_sta.shape[0])
+            print("phi min :", phi_sta.min().item())
+            print("phi max :", phi_sta.max().item())
+            print("phi mean:", phi_sta.mean().item())
+            print("phi std :", phi_sta.std().item())
+
+            print("\nRatio below thresholds:")
+            for t in thresholds:
+                ratio = (phi_sta < t).float().mean().item()
+                print(f"phi < {t:.1f} : {ratio*100:.2f}%")
+
+        print("\n==================================================\n")
+
+    # ---------------- SH Mask Distribution ----------------
+    if getattr(opt, "use_sh_adaptive", False):
+        print("\n================ SH Mask Distribution ================\n")
+        sh_threshold = getattr(opt, "phi_prune_sh", 0.1)
+
+        _print_rest_param_stats(
+            "dynamic",
+            getattr(gaussians, "_features_rest", None),
+            getattr(gaussians, "dynamic_sh_mask_logit", None),
+            sh_threshold,
+        )
+
+        _print_rest_param_stats(
+            "static",
+            getattr(gaussians, "static_features_rest", None),
+            getattr(gaussians, "static_sh_mask_logit", None),
+            sh_threshold,
+        )
+              
     print("\n==================================================\n")
 
-    # ---------------- Hard Pruning ----------------
+
+    # ---------------- Hard Pruning ---------------------------
     print("\n================ Hard Pruning Pipeline ================\n")
 
     dynamic_points_before = gaussians.get_xyz.shape[0]
     static_points_before = gaussians.get_static_xyz.shape[0]
     baseline_points = dynamic_points_before + static_points_before
 
+    phi_prune_dynamic = getattr(opt, "phi_prune_dynamic", 0.1)
+    phi_prune_static = getattr(opt, "phi_prune_static", 0.1)
+    sh_threshold = getattr(opt, "phi_prune_sh", 0.1)
+    
     print(f"\n[Baseline]")
     print(f"Points          : {baseline_points}")
     print(f"Dynamic_Points  : {dynamic_points_before}")
     print(f"Static_Points   : {static_points_before}")
+
+        
+    print("\n[Model Size Before Pruning]")
+
+    size_before_dense = gaussians.compute_model_size(
+        count_mode="dense",
+        include_dynamic=True,
+        include_static=True,
+        include_temporal=True,
+        include_masks=False,
+        include_sh_mask_logits=False,
+        verbose=False,
+    )
+
+    size_before_effective = gaussians.compute_model_size(
+        count_mode="effective",
+        include_dynamic=True,
+        include_static=True,
+        include_temporal=True,
+        include_masks=False,
+        include_sh_mask_logits=False,
+        phi_threshold_dynamic=phi_prune_dynamic if opt.use_pruning else None,
+        phi_threshold_static=phi_prune_static if opt.use_pruning else None,
+        sh_threshold=sh_threshold if opt.use_sh_adaptive else None,
+        verbose=False,
+    )
+
+    print(f"Dense size before pruning     : {size_before_dense['total_mb']:.4f} MB")
+    print(f"Effective size before pruning : {size_before_effective['total_mb']:.4f} MB")
+    print(f"Dynamic kept (effective)      : {size_before_effective['num_dynamic_kept']} / {size_before_effective['num_dynamic_points']}")
+    print(f"Static kept (effective)       : {size_before_effective['num_static_kept']} / {size_before_effective['num_static_points']}")
 
     print("\nEvaluating model BEFORE pruning on all test views...")
     all_test_views = list(scene.getTestCameras())
@@ -133,28 +231,79 @@ def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4
 
     print("\nApplying hard pruning...")
 
-    phi_prune_dynamic = getattr(opt, "phi_prune_dynamic", 0.1)
-    phi_prune_static = getattr(opt, "phi_prune_static", 0.1)
-
     if opt.use_pruning:
         gaussians.prune_low_dynamic_mask_points(threshold=phi_prune_dynamic)
         gaussians.prune_low_mask_points(threshold=phi_prune_static)
 
-    dynamic_points_after = gaussians.get_xyz.shape[0]
-    static_points_after = gaussians.get_static_xyz.shape[0]
-    new_count = dynamic_points_after + static_points_after
-    compression = (1 - new_count / baseline_points) * 100 if baseline_points > 0 else 0.0
+    if opt.use_sh_adaptive:
+        gaussians.hard_prune_sh(threshold=sh_threshold)
+        gaussians.use_sh_adaptive = False
+        if hasattr(gaussians, "enable_sh_mask"):
+            gaussians.enable_sh_mask = False
+    
+    if opt.use_pruning:
+        dynamic_points_after = gaussians.get_xyz.shape[0]
+        static_points_after = gaussians.get_static_xyz.shape[0]
+        new_count = dynamic_points_after + static_points_after
+        compression = (1 - new_count / baseline_points) * 100 if baseline_points > 0 else 0.0
 
-    print(f"\n[Hard Pruning]")
-    print(f"Dynamic before : {dynamic_points_before}")
-    print(f"Dynamic after  : {dynamic_points_after}")
-    print(f"Static before  : {static_points_before}")
-    print(f"Static after   : {static_points_after}")
-    print(f"Points before  : {baseline_points}")
-    print(f"Points after   : {new_count}")
-    print(f"Reduction      : {compression:.2f}%")
-    print(f"phi_prune_dynamic = {phi_prune_dynamic}")
-    print(f"phi_prune_static  = {phi_prune_static}")
+        print(f"\n[Hard Pruning]")
+        print(f"Dynamic before : {dynamic_points_before}")
+        print(f"Dynamic after  : {dynamic_points_after}")
+        print(f"Static before  : {static_points_before}")
+        print(f"Static after   : {static_points_after}")
+        print(f"Points before  : {baseline_points}")
+        print(f"Points after   : {new_count}")
+        print(f"Reduction      : {compression:.2f}%")
+        print(f"phi_prune_dynamic = {phi_prune_dynamic}")
+        print(f"phi_prune_static  = {phi_prune_static}")
+
+    if opt.use_sh_adaptive:
+        print("\nChecking SH zero ratio after hard pruning...")
+
+        dyn_zero_ratio = (
+            (gaussians._features_rest == 0).float().mean().item()
+        )
+
+        print(f"Dynamic SH zero ratio: {dyn_zero_ratio*100:.2f}%")
+
+        if hasattr(gaussians, "static_features_rest") and gaussians.static_features_rest is not None and gaussians.static_features_rest.numel() > 0:
+
+            sta_zero_ratio = (
+                (gaussians.static_features_rest == 0).float().mean().item()
+            )
+
+            print(f"Static SH zero ratio: {sta_zero_ratio*100:.2f}%")
+    
+    print("\n[Model Size After Pruning]")
+
+    size_after_dense = gaussians.compute_model_size(
+        count_mode="dense",
+        include_dynamic=True,
+        include_static=True,
+        include_temporal=True,
+        include_masks=False,
+        include_sh_mask_logits=False,
+        verbose=False,
+    )
+
+    size_after_effective = gaussians.compute_model_size(
+        count_mode="effective",
+        include_dynamic=True,
+        include_static=True,
+        include_temporal=True,
+        include_masks=False,
+        include_sh_mask_logits=False,
+        phi_threshold_dynamic=None,
+        phi_threshold_static=None,
+        sh_threshold=sh_threshold if opt.use_sh_adaptive else None,
+        verbose=False,
+    )
+
+    print(f"Dense size after pruning      : {size_after_dense['total_mb']:.4f} MB")
+    print(f"Effective size after pruning  : {size_after_effective['total_mb']:.4f} MB")
+    print(f"Dynamic kept after pruning    : {size_after_effective['num_dynamic_kept']} / {size_after_effective['num_dynamic_points']}")
+    print(f"Static kept after pruning     : {size_after_effective['num_static_kept']} / {size_after_effective['num_static_points']}")
 
     # ---------------- PSNR Evaluation ----------------
     print("\nEvaluating pruned model on all test views...")
@@ -187,7 +336,6 @@ def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4
     print(f"\nPSNR after pruning: {psnr_pruned:.4f}")
     print(f"SSIM after pruning: {ssim_pruned:.6f}")
     print(f"LPIPS after pruning: {lpips_pruned:.6f}")
-
     gaussExtractor = GaussianExtractor(gaussians, render, pipe, bg_color=bg_color)   
     
     #########   1. Validation and Rendering ############
@@ -269,7 +417,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Every 1000 its we increase the levels of SH up to a maximum degree
             if iteration % opt.sh_increase_interval == 0:
                 gaussians.oneupSHdegree()
-                
+            
+            sh_mask_start_iter = getattr(opt, "sh_mask_start_iter", 4500)
+            sh_mask_warmup_iters = getattr(opt, "sh_mask_warmup_iters", 1000)
+
+            gaussians.enable_sh_mask = (
+                opt.use_sh_adaptive and iteration >= sh_mask_start_iter
+            )
+
             # Render
             if (iteration - 1) == debug_from:
                 pipe.debug = True
@@ -323,6 +478,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     batch_time_support_stat.append(time_support_stat)
 
                 # Loss
+                Lstatic_mask = torch.tensor(0.0, device="cuda")
+                Ldynamic_mask = torch.tensor(0.0, device="cuda")
+                Lsh = torch.tensor(0.0, device="cuda")
                 Ll1 = l1_loss(image, gt_image)
                 Lssim = 1.0 - ssim(image, gt_image)
                 loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * Lssim
@@ -370,9 +528,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss = loss + opt.lambda_motion * Lmotion
                 ########################
 
-                ##########gsmask###############
+                ##########gs_mask###############
                 if opt.use_pruning and (opt.lambda_static_mask > 0 or opt.lambda_dynamic_mask > 0):
-                    Lstatic_mask = torch.tensor(0.0, device="cuda")
                     if hasattr(gaussians, "static_mask_logit") and gaussians.static_mask_logit.numel() > 0:
                         Lstatic_mask = torch.sigmoid(gaussians.static_mask_logit).mean()
                         if iteration > 3500:
@@ -382,11 +539,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                             loss = loss + current_lambda_static_mask * Lstatic_mask
 
-                    Ldynamic_mask = torch.tensor(0.0, device="cuda")
                     if hasattr(gaussians, "dynamic_mask_logit") and gaussians.dynamic_mask_logit.numel() > 0:
                         soft_dyn = torch.sigmoid(gaussians.dynamic_mask_logit).view(-1)
-
-                        # gate：接近静态转换阈值的点，不靠 prune，而靠 dynamic2static
+                        
                         st = gaussians.get_scaling_t.detach().view(-1)
                         gate = (st < opt.scale_t_threshold).float()
 
@@ -416,14 +571,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             warmup = min(1.0, (iteration - 3500) / 500)
                             current_lambda_dynamic_mask = opt.lambda_dynamic_mask * warmup
                             loss = loss + current_lambda_dynamic_mask * Ldynamic_mask
-                ##############################
+                ###################################
 
-                ###### SH mask Loss ######
-                if opt.lambda_sh > 0:
-                    # 这里先给一个简单的占位逻辑，防止报错
-                    # 实际逻辑应该是计算 SH 系数的稀疏度
-                    Lsh = torch.tensor(0.0, device="cuda") 
-                    loss = loss + opt.lambda_sh * Lsh
+                ############SH Loss################
+                if opt.use_sh_adaptive and opt.lambda_sh > 0:
+                    sh_weights = torch.tensor([3/15, 5/15, 7/15], device="cuda")
+                    total_sh_loss = torch.tensor(0.0, device="cuda")
+
+                    current_lambda_sh = 0.0
+                    if iteration >= sh_mask_start_iter:
+                        warmup = min(1.0, (iteration - sh_mask_start_iter) / sh_mask_warmup_iters)
+                        current_lambda_sh = opt.lambda_sh * warmup
+
+                    if hasattr(gaussians, 'dynamic_sh_mask_logit') and gaussians.dynamic_sh_mask_logit.numel() > 0:
+                        soft_dyn = torch.sigmoid(gaussians.dynamic_sh_mask_logit)
+                        L_dynamic_sh = (soft_dyn * sh_weights).sum(dim=1).mean()
+                        loss = loss + current_lambda_sh * L_dynamic_sh
+                        total_sh_loss = total_sh_loss + L_dynamic_sh
+
+                    if hasattr(gaussians, 'static_sh_mask_logit') and gaussians.static_sh_mask_logit.numel() > 0:
+                        soft_static = torch.sigmoid(gaussians.static_sh_mask_logit)
+                        L_static_sh = (soft_static * sh_weights).sum(dim=1).mean()
+                        loss = loss + current_lambda_sh * L_static_sh
+                        total_sh_loss = total_sh_loss + L_static_sh
+
+                    Lsh = total_sh_loss
+                #######################################
 
                 loss = loss / batch_size
                 loss.backward()

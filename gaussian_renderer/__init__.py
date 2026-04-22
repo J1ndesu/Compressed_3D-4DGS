@@ -64,12 +64,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means2D = screenspace_points
     opacity = pc.get_opacity
 
-    if getattr(pc, "use_pruning", False) and hasattr(pc, "dynamic_mask_logit") and getattr(pc, "dynamic_mask_logit") is not None and pc.dynamic_mask_logit.numel() > 0:
+    if getattr(pc, "enable_gs_mask", False) and getattr(pc, "use_pruning", False) and hasattr(pc, "dynamic_mask_logit") and getattr(pc, "dynamic_mask_logit") is not None and pc.dynamic_mask_logit.numel() > 0:
         dm_raw = pc.dynamic_mask_logit
         if dm_raw.numel() == 0 or dm_raw.shape[0] != means3D.shape[0]:
             dm = torch.ones((means3D.shape[0], 1), device=opacity.device, dtype=opacity.dtype)
         else:
-            dm = get_ste_mask(dm_raw)
+            dm = get_ste_mask(dm_raw, pc.phi_threshold)
             if dm.dim() == 1:
                 dm = dm.unsqueeze(1)
             dm = dm.to(opacity.dtype).to(opacity.device)
@@ -109,7 +109,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if override_color is None:
         raw_shs = pc.get_features
         if getattr(pc, "enable_sh_mask", False) and getattr(pc, "use_sh_adaptive", False) and hasattr(pc, 'dynamic_sh_mask_logit') and pc.dynamic_sh_mask_logit is not None and pc.dynamic_sh_mask_logit.numel() > 0:
-            sh_hard_masks = get_sh_masks(pc.dynamic_sh_mask_logit)
+            sh_hard_masks = get_sh_masks(pc.dynamic_sh_mask_logit, pc.phi_prune_sh)
             raw_shs = apply_sh_masks(raw_shs, sh_hard_masks)
 
         if pipe.convert_SHs_python:
@@ -169,23 +169,36 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
 
     means3D_static = pc.get_static_xyz
-    screenspace_points_static = torch.zeros_like(means3D_static, dtype=means3D_static.dtype, requires_grad=True, device="cuda") + 0
-    try:
-        screenspace_points_static.retain_grad()
-    except:
-        pass
+    if means3D_static.shape[0] > 0:
+        screenspace_points_static = torch.zeros_like(
+            means3D_static,
+            dtype=means3D_static.dtype,
+            device="cuda",
+            requires_grad=True
+        ) + 0
+        try:
+            screenspace_points_static.retain_grad()
+        except:
+            pass
+    else:
+        screenspace_points_static = torch.zeros_like(
+            means3D_static,
+            dtype=means3D_static.dtype,
+            device="cuda"
+        )
+
     means2D_static = screenspace_points_static
     opacity_static = pc.get_static_opacity
     sh_static = pc.get_static_features
     scales_static = pc.get_static_scaling
     rotations_static = pc.get_static_rotation
 
-    if getattr(pc, "use_pruning", False) and hasattr(pc, "static_mask_logit") and getattr(pc, "static_mask_logit") is not None and pc.static_mask_logit.numel() > 0:
+    if getattr(pc, "enable_gs_mask", False) and getattr(pc, "use_pruning", False) and hasattr(pc, "static_mask_logit") and getattr(pc, "static_mask_logit") is not None and pc.static_mask_logit.numel() > 0:
         sm_raw = pc.static_mask_logit
         if sm_raw.numel() == 0 or sm_raw.shape[0] != means3D_static.shape[0]:
             sm = torch.ones((means3D_static.shape[0], 1), device=opacity_static.device, dtype=opacity_static.dtype)
         else:
-            sm = get_ste_mask(sm_raw)
+            sm = get_ste_mask(sm_raw, pc.phi_threshold)
             if sm.dim() == 1:
                 sm = sm.unsqueeze(1)
             sm = sm.to(opacity_static.dtype).to(opacity_static.device)
@@ -193,7 +206,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         opacity_static = opacity_static * sm
 
     if getattr(pc, "enable_sh_mask", False) and getattr(pc, "use_sh_adaptive", False) and hasattr(pc, 'static_sh_mask_logit') and pc.static_sh_mask_logit is not None and pc.static_sh_mask_logit.numel() > 0:
-        sh_hard_masks_static = get_sh_masks(pc.static_sh_mask_logit)
+        sh_hard_masks_static = get_sh_masks(pc.static_sh_mask_logit, pc.phi_prune_sh)
         sh_static = apply_sh_masks(sh_static, sh_hard_masks_static)
 
     rendered_image, radii, depth, alpha, flow, covs_com, radii_static, color_4d, color_3d, invdepth = rasterizer(

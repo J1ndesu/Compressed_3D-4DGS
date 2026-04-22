@@ -64,14 +64,14 @@ OptimizationParams:
   use_sh_adaptive: True
   use_vq: False
 
-  lambda_static_mask: 0.0002
-  lambda_dynamic_mask: 0.0005
-  lambda_sh: 0.0005
+  lambda_static_mask: 0.0001
+  lambda_dynamic_mask: 0.0002
+  lambda_sh: 0.0002
 
-  phi_threshold: 0.1
-  phi_prune_dynamic: 0.25
-  phi_prune_static: 0.15
-  phi_prune_sh: 0.1
+  phi_threshold: 0.05
+  phi_prune_dynamic: 0.05
+  phi_prune_static: 0.05
+  phi_prune_sh: 0.05
 
   gs_mask_start_iter: 4000
   gs_mask_warmup_iters_static: 1000

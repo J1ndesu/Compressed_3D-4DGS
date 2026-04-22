@@ -97,20 +97,27 @@ class GaussianModel:
         
         self.active_sh_degree_t = 0
         self.max_sh_degree_t = sh_degree_t
-
-        self.static_xyz = torch.empty(0, device="cuda")
-        self.static_features_dc = torch.empty(0, device="cuda")
-        self.static_features_rest = torch.empty(0, device="cuda")
-        self.static_scaling = torch.empty(0, device="cuda")
-        self.static_rotation = torch.empty(0, device="cuda")
-        self.static_opacity = torch.empty(0, device="cuda")
-        self.static_max_radii2D = torch.empty(0)
-        self.static_denom = torch.empty(0)
-        self.static_xyz_gradient_accum = torch.empty(0)
+        
+        rest_ch = max(self.get_max_sh_channels - 1, 0)
+        self.static_xyz = torch.empty((0, 3), device="cuda")
+        self.static_features_dc = torch.empty((0, 1, 3), device="cuda")
+        self.static_features_rest = torch.empty((0, rest_ch, 3), device="cuda")
+        self.static_scaling = torch.empty((0, 3), device="cuda")
+        self.static_rotation = torch.empty((0, 4), device="cuda")
+        self.static_opacity = torch.empty((0, 1), device="cuda")
+        self.static_max_radii2D = torch.empty((0,), device="cuda")
+        self.static_denom = torch.empty((0, 1), device="cuda")
+        self.static_xyz_gradient_accum = torch.empty((0, 1), device="cuda")
         
         self.use_pruning = False
+        self.enable_gs_mask = False
         self.use_sh_adaptive = False
         self.enable_sh_mask = False
+
+        self.phi_threshold = 0.1
+        self.phi_prune_dynamic = 0.1
+        self.phi_prune_static = 0.1
+        self.phi_prune_sh = 0.1
 
         self.setup_functions()
 
@@ -228,6 +235,7 @@ class GaussianModel:
         if training_args is not None:
             self.training_setup(training_args)
             self.optimizer.load_state_dict(opt_dict)
+            self.enable_gs_mask = False
             self.enable_sh_mask = False
         
         if training_args is None:
@@ -477,6 +485,7 @@ class GaussianModel:
         self.use_pruning = training_args.use_pruning
         self.use_sh_adaptive = training_args.use_sh_adaptive
         self.use_vq = training_args.use_vq
+        self.enable_gs_mask = False
         self.enable_sh_mask = False
 
         self.static_mask_lr = training_args.static_mask_lr
@@ -531,6 +540,8 @@ class GaussianModel:
             self.lambda_static_mask = training_args.lambda_static_mask
             self.lambda_dynamic_mask = training_args.lambda_dynamic_mask
             self.phi_threshold = training_args.phi_threshold
+            self.phi_prune_dynamic = training_args.phi_prune_dynamic
+            self.phi_prune_static = training_args.phi_prune_static
             self.static_mask_logit = torch.empty((0, 1), device="cuda", dtype=torch.float32)            
             dyn_init = torch.full((dyn_num, 1), 0.0, device="cuda", dtype=torch.float32)
             self.dynamic_mask_logit = nn.Parameter(dyn_init.requires_grad_(True))
@@ -599,6 +610,9 @@ class GaussianModel:
         return optimizable_tensors
 
     def _prune_optimizer(self, mask, static=False):
+        if mask.dim() == 0:
+            mask = mask.unsqueeze(0)
+        
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             if static and 'static' not in group["name"]:
@@ -1088,9 +1102,10 @@ class GaussianModel:
                 self.densify_and_clone_static(static_grads, max_grad, extent)
                 self.densify_and_split_static(static_grads, max_grad, extent)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
         if len(self.static_xyz) != 0 and not dynamic_only:
-            prune_static_mask = (self.get_static_opacity < min_opacity).squeeze()
+            prune_static_mask = (self.get_static_opacity < min_opacity).squeeze(-1)
+
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
@@ -1146,7 +1161,7 @@ class GaussianModel:
 
 
     def dynamic2static(self, scale_threshold=3):
-        static_mask = (self.get_scaling_t > scale_threshold).squeeze()
+        static_mask = (self.get_scaling_t > scale_threshold).squeeze(-1)
         if static_mask.sum() == 0:
             return
         new_xyz = self._xyz[static_mask]

@@ -32,12 +32,53 @@ from torch.utils.data import DataLoader
 
 from utils.mesh_utils import GaussianExtractor
 from utils.render_utils import generate_path, create_videos
+import torchvision
 
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
+def save_final_test_images(scene, gaussians, pipe, background, iteration, save_gt=True):
+    test_set = scene.getTestCameras()
+    if len(test_set) == 0:
+        print(f"[ITER {iteration}] No test cameras found, skip saving test images.")
+        return
+
+    save_dir = os.path.join(scene.model_path, "test_images", f"iter_{iteration}")
+    os.makedirs(save_dir, exist_ok=True)
+
+    with torch.no_grad():
+        for idx in range(len(test_set)):
+            sample = test_set[idx]
+
+            if isinstance(sample, (tuple, list)) and len(sample) == 2:
+                gt_image, viewpoint_cam = sample
+                gt_image = gt_image.cuda()
+            else:
+                gt_image = None
+                viewpoint_cam = sample
+
+            viewpoint_cam = viewpoint_cam.cuda()
+
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+            pred = render_pkg["render"].clamp(0.0, 1.0)
+
+            image_name = getattr(viewpoint_cam, "image_name", f"{idx:05d}")
+
+            torchvision.utils.save_image(
+                pred,
+                os.path.join(save_dir, f"{image_name}_pred.png")
+            )
+
+            if save_gt and gt_image is not None:
+                torchvision.utils.save_image(
+                    gt_image.clamp(0.0, 1.0),
+                    os.path.join(save_dir, f"{image_name}_gt.png")
+                )
+
+    print(f"[ITER {iteration}] Final test images saved to {save_dir}")
 
 def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4d, force_sh_3d,
                num_pts, num_pts_ratio):
@@ -339,10 +380,11 @@ def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4
     gaussExtractor = GaussianExtractor(gaussians, render, pipe, bg_color=bg_color)   
     
     #########   1. Validation and Rendering ############
-
-    # print("export rendered testing images ...")
+    print("export rendered testing images ...")
+    if len(scene.getTestCameras()) > 0:
+        save_final_test_images(scene, gaussians, pipe, background, 6000)
     # os.makedirs(test_dir, exist_ok=True)
-    # gaussExtractor.reconstruction(scene.getTestCameras(),test_dir,stage = "validation")
+    gaussExtractor.reconstruction(scene.getTestCameras(),test_dir,stage = "validation")
     # gaussExtractor.export_image(test_dir,mode = "validation")
 
     # #########    2. Render Trajectory       ############
@@ -374,6 +416,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    print("\n================ Pruning Args ================\n")
+    print(f"use_pruning                  : {getattr(opt, 'use_pruning', False)}")
+    print(f"use_sh_adaptive              : {getattr(opt, 'use_sh_adaptive', False)}")
+
+    print(f"lambda_static_mask           : {getattr(opt, 'lambda_static_mask', 'N/A')}")
+    print(f"lambda_dynamic_mask          : {getattr(opt, 'lambda_dynamic_mask', 'N/A')}")
+    print(f"lambda_sh                    : {getattr(opt, 'lambda_sh', 'N/A')}")
+
+    print(f"static_mask_lr               : {getattr(opt, 'static_mask_lr', 'N/A')}")
+    print(f"dynamic_mask_lr              : {getattr(opt, 'dynamic_mask_lr', 'N/A')}")
+    print(f"sh_mask_lr                   : {getattr(opt, 'sh_mask_lr', 'N/A')}")
+
+    print(f"phi_threshold                : {getattr(opt, 'phi_threshold', 'N/A')}")
+    print(f"phi_prune_dynamic            : {getattr(opt, 'phi_prune_dynamic', 'N/A')}")
+    print(f"phi_prune_static             : {getattr(opt, 'phi_prune_static', 'N/A')}")
+    print(f"phi_prune_sh                 : {getattr(opt, 'phi_prune_sh', 'N/A')}")
+
+    print(f"gs_mask_start_iter           : {getattr(opt, 'gs_mask_start_iter', 3500)}")
+    print(f"gs_mask_warmup_iters_static  : {getattr(opt, 'gs_mask_warmup_iters_static', 1000)}")
+    print(f"gs_mask_warmup_iters_dynamic : {getattr(opt, 'gs_mask_warmup_iters_dynamic', 500)}")
+
+    print(f"sh_mask_start_iter           : {getattr(opt, 'sh_mask_start_iter', 4000)}")
+    print(f"sh_mask_warmup_iters         : {getattr(opt, 'sh_mask_warmup_iters', 1000)}")
+
+    print("\n==============================================\n")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -418,11 +486,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration % opt.sh_increase_interval == 0:
                 gaussians.oneupSHdegree()
             
-            sh_mask_start_iter = getattr(opt, "sh_mask_start_iter", 4500)
+            sh_mask_start_iter = getattr(opt, "sh_mask_start_iter", 4000)
             sh_mask_warmup_iters = getattr(opt, "sh_mask_warmup_iters", 1000)
 
             gaussians.enable_sh_mask = (
                 opt.use_sh_adaptive and iteration >= sh_mask_start_iter
+            )
+
+            gs_mask_start_iter = getattr(opt, "gs_mask_start_iter", 3500)
+            gs_mask_warmup_iters_static = getattr(opt, "gs_mask_warmup_iters_static", 1000)
+            gs_mask_warmup_iters_dynamic = getattr(opt, "gs_mask_warmup_iters_dynamic", 500)
+            gaussians.enable_gs_mask = (
+                opt.use_pruning and iteration >= gs_mask_start_iter
             )
 
             # Render
@@ -532,9 +607,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if opt.use_pruning and (opt.lambda_static_mask > 0 or opt.lambda_dynamic_mask > 0):
                     if hasattr(gaussians, "static_mask_logit") and gaussians.static_mask_logit.numel() > 0:
                         Lstatic_mask = torch.sigmoid(gaussians.static_mask_logit).mean()
-                        if iteration > 3500:
+                        if iteration >= gs_mask_start_iter:
                             # 3500~4500 iter warmup
-                            warmup = min(1.0, (iteration - 3500) / 1000)
+                            warmup = min(1.0, (iteration - gs_mask_start_iter) / gs_mask_warmup_iters_static)
                             current_lambda_static_mask = opt.lambda_static_mask * warmup
 
                             loss = loss + current_lambda_static_mask * Lstatic_mask
@@ -567,8 +642,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         effective_weight = gate * weight
                         Ldynamic_mask = (effective_weight * soft_dyn).sum() / (effective_weight.sum() + 1e-6)
 
-                        if iteration > 3500:
-                            warmup = min(1.0, (iteration - 3500) / 500)
+                        if iteration >= gs_mask_start_iter:
+                            warmup = min(1.0, (iteration - gs_mask_start_iter) / gs_mask_warmup_iters_dynamic)
                             current_lambda_dynamic_mask = opt.lambda_dynamic_mask * warmup
                             loss = loss + current_lambda_dynamic_mask * Ldynamic_mask
                 ###################################
@@ -576,26 +651,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ############SH Loss################
                 if opt.use_sh_adaptive and opt.lambda_sh > 0:
                     sh_weights = torch.tensor([3/15, 5/15, 7/15], device="cuda")
-                    total_sh_loss = torch.tensor(0.0, device="cuda")
 
                     current_lambda_sh = 0.0
                     if iteration >= sh_mask_start_iter:
                         warmup = min(1.0, (iteration - sh_mask_start_iter) / sh_mask_warmup_iters)
                         current_lambda_sh = opt.lambda_sh * warmup
 
-                    if hasattr(gaussians, 'dynamic_sh_mask_logit') and gaussians.dynamic_sh_mask_logit.numel() > 0:
-                        soft_dyn = torch.sigmoid(gaussians.dynamic_sh_mask_logit)
+                    total_weighted_sh = torch.tensor(0.0, device="cuda")
+                    total_num_sh = 0
+
+                    if hasattr(gaussians, 'dynamic_sh_mask_logit') and gaussians.dynamic_sh_mask_logit is not None and gaussians.dynamic_sh_mask_logit.numel() > 0:
+                        soft_dyn = torch.sigmoid(gaussians.dynamic_sh_mask_logit)   # [Nd, 3]
                         L_dynamic_sh = (soft_dyn * sh_weights).sum(dim=1).mean()
-                        loss = loss + current_lambda_sh * L_dynamic_sh
-                        total_sh_loss = total_sh_loss + L_dynamic_sh
+                        nd = soft_dyn.shape[0]
 
-                    if hasattr(gaussians, 'static_sh_mask_logit') and gaussians.static_sh_mask_logit.numel() > 0:
-                        soft_static = torch.sigmoid(gaussians.static_sh_mask_logit)
+                        total_weighted_sh = total_weighted_sh + nd * L_dynamic_sh
+                        total_num_sh += nd
+
+                    if hasattr(gaussians, 'static_sh_mask_logit') and gaussians.static_sh_mask_logit is not None and gaussians.static_sh_mask_logit.numel() > 0:
+                        soft_static = torch.sigmoid(gaussians.static_sh_mask_logit) # [Ns, 3]
                         L_static_sh = (soft_static * sh_weights).sum(dim=1).mean()
-                        loss = loss + current_lambda_sh * L_static_sh
-                        total_sh_loss = total_sh_loss + L_static_sh
+                        ns = soft_static.shape[0]
 
-                    Lsh = total_sh_loss
+                        total_weighted_sh = total_weighted_sh + ns * L_static_sh
+                        total_num_sh += ns
+
+                    if total_num_sh > 0:
+                        Lsh = total_weighted_sh / total_num_sh
+                        loss = loss + current_lambda_sh * Lsh
                 #######################################
 
                 loss = loss / batch_size
@@ -880,7 +963,6 @@ if __name__ == "__main__":
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-        
     cfg = OmegaConf.load(args.config)
 
     def recursive_merge(key, host):
@@ -892,7 +974,6 @@ if __name__ == "__main__":
             setattr(args, key, host[key])
     for k in cfg.keys():
         recursive_merge(k, cfg)
-        
     if args.exhaust_test:
         args.test_iterations = args.test_iterations + [i for i in range(0,args.iterations,500)]
     

@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+"""Render hybrid Gaussians and expose screen-space gradients for densification."""
+
 import torch
 from torch.nn import functional as F
 import math
@@ -19,10 +21,20 @@ from collections import defaultdict
 from utils.compression_utils import get_ste_mask, get_sh_masks, apply_sh_masks
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
-    """
-    Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
+    """Render the dynamic and static pools with optional learned gates.
+
+    Args:
+        viewpoint_camera: Camera with transforms, image size, and timestamp.
+        pc: GaussianModel containing CUDA tensors and mask activation flags.
+        pipe: Rasterization and SH evaluation options.
+        bg_color: CUDA RGB background tensor of shape (3,).
+        scaling_modifier: Multiplier applied to Gaussian scales.
+        override_color: Optional precomputed dynamic colors, bypassing dynamic SH.
+
+    Returns:
+        A dictionary containing RGB, depth, alpha, flow, pool-specific renders,
+        screen-space tensors, radii, and visibility masks used by densification.
+        Gaussian gates scale opacity; SH gates zero bands without dropping rows.
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -242,8 +254,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         tv = torch.acos(xyz_inter[...,2:3] / R) / torch.pi
         texcoord = torch.cat([tu, tv], dim=-1) * 2 - 1
         bg_color_from_envmap = F.grid_sample(pc.env_map[None], texcoord[None])[0] # 3,H,W
-        # mask2 = (0 < xyz_inter[...,0]) & (xyz_inter[...,1] > 0) # & (xyz_inter[...,2] > -19)
-        rendered_image = rendered_image + (1 - alpha) * bg_color_from_envmap # * mask2[None]
+        rendered_image = rendered_image + (1 - alpha) * bg_color_from_envmap
     
     if pipe.compute_cov3D_python and pc.gaussian_dim == 4:
         radii_all = radii.new_zeros(mask.shape)

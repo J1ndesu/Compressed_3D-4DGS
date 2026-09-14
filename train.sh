@@ -1,12 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+# Run from the repository root; edit dataset roots, scenes, and GPU below.
 device=0
 python_bin=python
 
 TRAIN_N3V=true
 TRAIN_DNERF=true
 
+# These are local example paths and must match your machine.
 n3v_root="/root/autodl-tmp/data/N3V"
 dnerf_root="/root/autodl-tmp/data/dnerf"
 
@@ -33,6 +35,7 @@ dnerf_scenes=(
     # "trex"
 )
 
+# YAML overrides matching CLI options passed through this array.
 method_args=()
 
 train_one_scene () {
@@ -85,5 +88,6 @@ run_dataset_group () {
     done
 }
 
+# N3V execution is disabled below; uncomment the call and select scenes to enable it.
 #run_dataset_group "${TRAIN_N3V}"   "N3V"   "${n3v_root}"   "${n3v_config}"   "${n3v_scenes[@]}"
 run_dataset_group "${TRAIN_DNERF}" "DNeRF" "${dnerf_root}" "${dnerf_config}" "${dnerf_scenes[@]}"

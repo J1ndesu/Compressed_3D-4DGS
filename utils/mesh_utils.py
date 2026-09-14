@@ -26,14 +26,7 @@ import time
 
 class GaussianExtractor(object):
     def __init__(self, gaussians, render, pipe, bg_color=None):
-        """
-        a class that extracts attributes a scene presented by 2DGS
-
-        Usage example:
-        >>> gaussExtrator = GaussianExtractor(gaussians, render, pipe)
-        >>> gaussExtrator.reconstruction(view_points)
-        >>> mesh = gaussExtractor.export_mesh_bounded(...)
-        """
+        """Initialize render buffers and bind the Gaussian model, renderer, and pipeline."""
         if bg_color is None:
             bg_color = [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -55,8 +48,10 @@ class GaussianExtractor(object):
 
     @torch.no_grad()
     def reconstruction(self, viewpoint_stack, model_path , stage = "validation"):
-        """
-        reconstruct radiance field given cameras
+        """Render views into CPU buffers and write aggregate metrics for validation.
+
+        Validation writes stats/validation.json under model_path. Call export_image
+        separately to write the buffered render components as images.
         """
         self.clean()
         self.viewpoint_stack = viewpoint_stack

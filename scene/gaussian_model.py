@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+"""Hybrid Gaussian parameters, densification, pruning, and payload-size accounting."""
+
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation, build_rotation_4d, build_scaling_rotation_4d, rotation_matrix_to_rotation_3d
@@ -25,6 +27,11 @@ from utils.compression_utils import get_ste_mask, get_sh_masks
 
 class GaussianModel:
 
+    """Manage dynamic and static Gaussian tensors, masks, and optimizer state.
+
+    Gaussian mask logits have shape (N, 1); spatial SH mask logits have shape
+    (N, 3). Point removal must keep parameters, mask rows, and statistics aligned.
+    """
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
@@ -122,6 +129,7 @@ class GaussianModel:
         self.setup_functions()
 
     def capture(self):
+        """Pack model tensors and optimizer state in the positional checkpoint format."""
         if self.gaussian_dim == 3:
             return (
                 self.active_sh_degree,
@@ -178,6 +186,11 @@ class GaussianModel:
             )
     
     def restore(self, model_args, training_args):
+        """Restore a positional checkpoint for training or evaluation.
+
+        Pass training_args=None to avoid creating an optimizer. Checkpoints must
+        match this branch's tuple layout; cross-branch conversion is not provided.
+        """
         if self.gaussian_dim == 3:
             (self.active_sh_degree, 
             self._xyz, 
@@ -332,11 +345,12 @@ class GaussianModel:
         else:
             return self.get_scaling_t * scaling_modifier
 
-    def get_marginal_t(self, timestamp, scaling_modifier = 1): # Standard
+    def get_marginal_t(self, timestamp, scaling_modifier = 1):
         sigma = self.get_cov_t(scaling_modifier)
-        return torch.exp(-0.5*(self.get_t-timestamp)**2/sigma) # / torch.sqrt(2*torch.pi*sigma)
+        return torch.exp(-0.5*(self.get_t-timestamp)**2/sigma)
     
     def get_covariance(self, scaling_modifier = 1):
+        """Return the unnormalized temporal Gaussian weight at the requested timestamp."""
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
     
     def get_current_covariance_and_mean_offset(self, scaling_modifier = 1, timestamp = 0.0):
@@ -347,7 +361,7 @@ class GaussianModel:
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
-        # All channels except the 3 DC
+        # Flatten non-DC SH coefficients after the three RGB DC values.
         for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
             l.append('f_dc_{}'.format(i))
 
@@ -362,6 +376,11 @@ class GaussianModel:
         return l
     
     def save_ply(self, path):
+        """Export spatial attributes from the dynamic pool to PLY.
+
+        The static pool, temporal parameters, masks, and optimizer state are not
+        included. Use the checkpoint saved by Scene.save for the full model.
+        """
         mkdir_p(os.path.dirname(path))
         xyz = self.get_xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
@@ -413,7 +432,6 @@ class GaussianModel:
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
         if self.gaussian_dim == 4:
-            # dist_t = torch.clamp_min(distCUDA2(fused_times.repeat(1,3)), 1e-10)[...,None]
             dist_t = torch.zeros_like(fused_times, device="cuda") + (self.time_duration[1] - self.time_duration[0]) / 5
             scales_t = torch.log(torch.sqrt(dist_t))
             if self.rot_4d:
@@ -482,6 +500,11 @@ class GaussianModel:
         self._rotation_r = nn.Parameter(rots_r.requires_grad_(True))
 
     def training_setup(self, training_args):
+        """Initialize optimizer groups, mask logits, and training statistics.
+
+        Calling this resets mask logits and accumulators. Gates start disabled;
+        the training loop enables them at the configured start iterations.
+        """
         self.use_pruning = training_args.use_pruning
         self.use_sh_adaptive = training_args.use_sh_adaptive
         self.use_vq = training_args.use_vq
@@ -579,10 +602,6 @@ class GaussianModel:
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
-            # if param_group["name"] == "t" and self.gaussian_dim == 4:
-            #     lr = self.xyz_scheduler_args(iteration)
-            #     param_group['lr'] = lr
-            #     return lr
 
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
@@ -610,6 +629,11 @@ class GaussianModel:
         return optimizable_tensors
 
     def _prune_optimizer(self, mask, static=False):
+        """Keep rows selected by mask in one pool's parameters and Adam moments.
+
+        Unlike prune_points and prune_static_points, True means KEEP here.
+        Groups whose first dimension does not match the mask are left unchanged.
+        """
         if mask.dim() == 0:
             mask = mask.unsqueeze(0)
         
@@ -623,7 +647,6 @@ class GaussianModel:
             params = group["params"][0]
         
             if params.shape[0] != mask.shape[0]:
-                # print(f"Skipping {group['name']} due to shape mismatch")
                 optimizable_tensors[group["name"]] = params
                 continue
 
@@ -643,6 +666,7 @@ class GaussianModel:
         return optimizable_tensors
 
     def prune_points(self, mask):
+        """Remove dynamic-pool rows where mask is True and align their masks and statistics."""
         valid_points_mask = ~mask
         
         if self.optimizer is None:
@@ -714,6 +738,7 @@ class GaussianModel:
             self.dynamic_sh_mask_logit = optimizable_tensors["dynamic_sh_mask_logit"]
 
     def prune_static_points(self, mask):
+        """Remove static-pool rows where mask is True and align their masks and statistics."""
         valid_points_mask = ~mask
         
         if self.optimizer is None:
@@ -757,6 +782,7 @@ class GaussianModel:
         
 
     def cat_tensors_to_optimizer(self, tensors_dict):
+        """Append parameter rows and extend existing Adam moments with zeros."""
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
@@ -783,6 +809,7 @@ class GaussianModel:
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_dynamic_mask_logit = None, new_dynamic_sh_mask_logit = None):
 
+        """Append dynamic Gaussians and masks, then reset dynamic densification statistics."""
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -854,6 +881,7 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def densification_postfix_static(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_static_mask_logit = None, new_static_sh_mask_logit = None):
+        """Append static Gaussians and masks, then reset static densification statistics."""
         d = {"static_xyz": new_xyz,
         "static_f_dc": new_features_dc,
         "static_f_rest": new_features_rest,
@@ -910,10 +938,8 @@ class GaussianModel:
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        #if not tsplit:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
-        # print(f"num_to_densify_pos: {torch.where(padded_grad >= grad_threshold, True, False).sum()}, num_to_split_pos: {selected_pts_mask.sum()}")
 
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N)) 
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
@@ -976,7 +1002,6 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        # print(f"num_to_densify_pos: {torch.where(grads >= grad_threshold, True, False).sum()}, num_to_clone_pos: {selected_pts_mask.sum()}")
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -1000,14 +1025,14 @@ class GaussianModel:
             if hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit.numel() > 0:
                 new_dynamic_mask_logit = self.dynamic_mask_logit[selected_pts_mask]
             else:
-                new_dynamic_mask_logit = torch.full((selected_pts_mask.sum(), 1), 0.0, device="cuda") #0.5
+                new_dynamic_mask_logit = torch.full((selected_pts_mask.sum(), 1), 0.0, device="cuda") # Zero logits correspond to sigmoid probability 0.5.
 
         new_dynamic_sh_mask_logit = None
         if self.use_sh_adaptive:
             if hasattr(self, "dynamic_sh_mask_logit") and self.dynamic_sh_mask_logit.numel() > 0:
                 new_dynamic_sh_mask_logit = self.dynamic_sh_mask_logit[selected_pts_mask]
             else:            
-                new_dynamic_sh_mask_logit = torch.full((selected_pts_mask.sum(), 3), 0.0, device="cuda") #0.5
+                new_dynamic_sh_mask_logit = torch.full((selected_pts_mask.sum(), 3), 0.0, device="cuda") # Zero logits correspond to sigmoid probability 0.5.
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_dynamic_mask_logit, new_dynamic_sh_mask_logit)
 
@@ -1039,7 +1064,7 @@ class GaussianModel:
                 if N > 1:
                     new_mask_logit = new_mask_logit.repeat(N, 1)
             else:
-                new_mask_logit = torch.full((N * selected_pts_mask.sum(), 1), 0.0, device="cuda")#0.5
+                new_mask_logit = torch.full((N * selected_pts_mask.sum(), 1), 0.0, device="cuda")# Zero logits correspond to sigmoid probability 0.5.
 
         new_static_sh_mask_logit = None
         if self.use_sh_adaptive:
@@ -1048,7 +1073,7 @@ class GaussianModel:
                 if N > 1:
                     new_static_sh_mask_logit = new_static_sh_mask_logit.repeat(N, 1)
             else:            
-                new_static_sh_mask_logit = torch.full((N * selected_pts_mask.sum(), 3), 0.0, device="cuda")#0.5
+                new_static_sh_mask_logit = torch.full((N * selected_pts_mask.sum(), 3), 0.0, device="cuda")# Zero logits correspond to sigmoid probability 0.5.
         
         self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_mask_logit, new_static_sh_mask_logit)
 
@@ -1073,26 +1098,26 @@ class GaussianModel:
             if hasattr(self, "static_mask_logit") and self.static_mask_logit.numel() > 0:
                 new_mask_logit = self.static_mask_logit[selected_pts_mask]
             else:
-                new_mask_logit = torch.full((selected_pts_mask.sum(), 1), 0.0, device="cuda") #0.5
+                new_mask_logit = torch.full((selected_pts_mask.sum(), 1), 0.0, device="cuda") # Zero logits correspond to sigmoid probability 0.5.
 
         new_static_sh_mask_logit = None
         if self.use_sh_adaptive:
             if hasattr(self, "static_sh_mask_logit") and self.static_sh_mask_logit.numel() > 0:
                 new_static_sh_mask_logit = self.static_sh_mask_logit[selected_pts_mask]
             else:            
-                new_static_sh_mask_logit = torch.full((selected_pts_mask.sum(), 3), 0.0, device="cuda") #0.5
+                new_static_sh_mask_logit = torch.full((selected_pts_mask.sum(), 3), 0.0, device="cuda") # Zero logits correspond to sigmoid probability 0.5.
         
         self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_mask_logit, new_static_sh_mask_logit)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, max_grad_t=None, prune_only=False, dynamic_only=False):
+        """Optionally clone/split high-gradient points, then prune opacity and size outliers.
+
+        max_grad_t is accepted for compatibility but is not used for selection.
+        Learned-mask hard pruning is handled by the separate prune_low_* methods.
+        """
         if not prune_only:
             grads = self.xyz_gradient_accum / self.denom
             grads[grads.isnan()] = 0.0
-            # if self.gaussian_dim == 4:
-            #     grads_t = self.t_gradient_accum / self.denom
-            #     grads_t[grads_t.isnan()] = 0.0
-            # else:
-            #     grads_t = None
 
             self.densify_and_clone(grads, max_grad, extent)
             self.densify_and_split(grads, max_grad, extent)
@@ -1122,6 +1147,7 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter, avg_t_grad=None, alpha_stat=None, motion_stat=None, time_support_stat=None):
+        """Accumulate screen-space gradients and available 4D statistics for visible rows."""
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
         if self.gaussian_dim == 4:
@@ -1139,6 +1165,7 @@ class GaussianModel:
                 self.dynamic_time_support_accum[update_filter] += time_support_stat[update_filter]
         
     def add_densification_stats_grad(self, viewspace_point_grad, update_filter, avg_t_grad=None, alpha_stat=None, motion_stat=None, time_support_stat=None):
+        """Accumulate batch-aggregated gradients and statistics for visible dynamic rows."""
         self.xyz_gradient_accum[update_filter] += viewspace_point_grad[update_filter]
         self.denom[update_filter] += 1
         if self.gaussian_dim == 4:
@@ -1156,11 +1183,17 @@ class GaussianModel:
             self.dynamic_time_support_accum[update_filter] += time_support_stat[update_filter]
 
     def add_densification_stats_grad_static(self, viewspace_point_grad, update_filter):
+        """Accumulate batch-aggregated gradients for visible static rows."""
         self.static_xyz_gradient_accum[update_filter] += viewspace_point_grad[update_filter]
         self.static_denom[update_filter] += 1
 
 
     def dynamic2static(self, scale_threshold=3):
+        """Move 4D Gaussians with temporal scale above scale_threshold to the static pool.
+
+        Convert their rotation to 3D and initialize enabled static mask logits to
+        zero (sigmoid probability 0.5), rather than copying the dynamic masks.
+        """
         static_mask = (self.get_scaling_t > scale_threshold).squeeze(-1)
         if static_mask.sum() == 0:
             return
@@ -1186,8 +1219,9 @@ class GaussianModel:
         self.densification_postfix_static(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_static_mask_logit, new_static_sh_mask_logit)
 
     def prune_low_mask_points(self, threshold=0.1):
-        """
-        对静态点进行硬剪枝（只剪静态 3D 池）
+        """Remove static Gaussians whose sigmoid mask is <= threshold.
+
+        Operate in place and keep Gaussian/SH mask rows aligned with surviving points.
         """
         if self.use_pruning and (hasattr(self, "static_mask_logit") and self.static_mask_logit is not None and self.static_mask_logit.numel() > 0 and hasattr(self, "static_xyz") and self.static_xyz.shape[0] > 0):
             sm = torch.sigmoid(self.static_mask_logit)
@@ -1230,8 +1264,9 @@ class GaussianModel:
 
     
     def prune_low_dynamic_mask_points(self, threshold=0.1):
-        """
-        对动态点进行硬剪枝（只剪动态 4D 池）
+        """Remove dynamic Gaussians whose sigmoid mask is <= threshold.
+
+        Operate in place and keep Gaussian/SH mask rows aligned with surviving points.
         """
         if self.use_pruning and (hasattr(self, "dynamic_mask_logit") and self.dynamic_mask_logit is not None and self.dynamic_mask_logit.numel() > 0 and hasattr(self, "_xyz") and self._xyz.shape[0] > 0):
             dm = torch.sigmoid(self.dynamic_mask_logit)
@@ -1275,10 +1310,12 @@ class GaussianModel:
 
     @torch.no_grad()
     def hard_prune_sh(self, threshold=0.1):
-        """
-        Independent hard prune for SH coefficients.
-        Keep tensor shape unchanged.
-        Only zero corresponding SH bands independently.
+        """Zero spatial SH bands whose sigmoid masks are <= threshold in both pools.
+
+        The non-DC tensor uses slices 0:3, 3:8, and 8:15 for bands 1, 2, and 3.
+        Bands are independent. DC and any channels after the first 15 non-DC
+        channels are preserved. Tensor shapes and dense storage do not shrink.
+        This is an evaluation operation; it does not rebuild optimizer references.
         """
 
         def prune_branch(features_rest, sh_mask_logit, branch_name="dynamic"):
@@ -1291,7 +1328,7 @@ class GaussianModel:
 
             soft_sh = torch.sigmoid(sh_mask_logit)
 
-            # independent gating
+            # Gate each band independently; features_rest excludes DC.
             m1 = (soft_sh[:, 0] > threshold).to(features_rest.dtype)[:, None, None]  # l=1
             m2 = (soft_sh[:, 1] > threshold).to(features_rest.dtype)[:, None, None]  # l=2
             m3 = (soft_sh[:, 2] > threshold).to(features_rest.dtype)[:, None, None]  # l=3
@@ -1340,18 +1377,30 @@ class GaussianModel:
         override_dtype_bytes=None,       # None -> use tensor.element_size(); 2 -> fp16; 4 -> fp32
         verbose=False,
     ):
-        """
-        统计模型大小（默认不含 optimizer state）。
+        """Estimate tensor payload size; this is not checkpoint size or GPU memory usage.
 
-        两种模式：
-        1) dense:
-        - 按当前 tensor shape 直接统计
-        - 适合原始 checkpoint / 原始 dense 存储大小
+        Args:
+            include_dynamic: Count dynamic-pool parameters.
+            include_static: Count static-pool parameters.
+            include_temporal: Include temporal parameters for 4D Gaussians.
+            include_masks: Include full Gaussian mask-logit tensors.
+            include_sh_mask_logits: Include full SH mask-logit tensors.
+            include_env_map: Include the environment-map tensor.
+            include_training_stats: Include available full training-statistic tensors.
+            count_mode: "dense" counts allocated tensor elements; "effective" uses
+                optional point and SH thresholds to estimate a retained payload.
+            phi_threshold_dynamic: Dynamic keep threshold, or None to count all rows.
+            phi_threshold_static: Static keep threshold, or None to count all rows.
+            sh_threshold: SH band threshold, or None to count every retained channel.
+            override_dtype_bytes: Assumed bytes per value; None uses each tensor dtype.
+                This changes accounting only and does not convert tensors.
+            verbose: Print the breakdown.
 
-        2) effective:
-        - 可结合 phi_threshold_* 和 sh_threshold，只统计“有效”参数
-        - 适合做 RDO / ablation 的 rate 估计
-        - 注意：SH hard prune 只置零不改 shape，因此 dense 模式下 SH 不会变小，effective 模式才会体现 SH 压缩收益
+        Returns:
+            A dictionary with total and per-component bytes, sizes under legacy
+            *_mb keys (actually MiB, bytes / 1024**2), point counts, and count mode.
+            Optimizer state and serialization/index overhead are never counted.
+            Effective mode estimates retained bands from masks, not from zero values.
         """
         assert count_mode in ["dense", "effective"]
 
@@ -1385,12 +1434,9 @@ class GaussianModel:
             return keep
 
         def _features_rest_bytes(features_rest, sh_mask_logit=None, point_keep_mask=None, sh_thr=None):
-            """
-            对 features_rest 做两种统计：
-            - dense: 直接按 tensor shape 计
-            - effective:
-                * 若不给 sh_thr：仍按保留下来的点的 dense shape 计
-                * 若给 sh_thr：只统计有效 SH bands（l1/l2/l3）+ tail
+            """Count dense non-DC coefficients or mask-selected spatial bands plus the tail.
+
+            Without an SH threshold or valid SH logits, count all channels of kept points.
             """
             if not _is_valid_tensor(features_rest):
                 return 0
@@ -1402,9 +1448,7 @@ class GaussianModel:
             if count_mode == "dense" or sh_thr is None:
                 return int(t.numel()) * _elem_bytes(t)
 
-            # effective 模式下，按 SH band 实际有效通道数计算
-            # 约定前 15 个通道对应 spatial SH 的 l1/l2/l3: 3 / 5 / 7
-            # 这和你 hard_prune_sh() / apply_sh_masks() 的写法一致
+            # Match hard_prune_sh: the first 15 non-DC channels use band sizes 3/5/7.
             if t.numel() == 0:
                 return 0
 
@@ -1423,7 +1467,7 @@ class GaussianModel:
             if sh.shape[0] != n_pts:
                 return int(t.numel()) * bytes_per_elem
 
-            # 前 15 个 spatial channels
+            # Separate spatial bands from any unmasked extra channels.
             spatial_ch = min(n_ch, 15)
             tail_ch = max(n_ch - 15, 0)
 
@@ -1432,10 +1476,10 @@ class GaussianModel:
             m2 = (torch.sigmoid(sh[:, 1]) > sh_thr)
             m3 = (torch.sigmoid(sh[:, 2]) > sh_thr)
 
-            # l1/l2/l3 分别占 3/5/7 个通道
+            # Count 3, 5, and 7 channels for each retained band.
             kept_spatial_ch = 0
             if spatial_ch > 0:
-                # 只在前 15 通道范围内计数
+                # Clamp counts to the available spatial channels.
                 ch_l1 = min(max(spatial_ch - 0, 0), 3)
                 ch_l2 = min(max(spatial_ch - 3, 0), 5)
                 ch_l3 = min(max(spatial_ch - 8, 0), 7)

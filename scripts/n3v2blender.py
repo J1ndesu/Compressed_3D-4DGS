@@ -1,3 +1,5 @@
+"""Convert one Neural 3D Video scene to Blender transforms, half-size images, and a point cloud."""
+
 import os
 import argparse
 import glob
@@ -247,7 +249,7 @@ def rotmat(a, b):
     return np.eye(3) + kmat + kmat.dot(kmat) * ((1 - c) / (s ** 2 + 1e-10))
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser() # TODO: refine it.
+    parser = argparse.ArgumentParser() # Accept one scene directory containing MP4 videos and poses_bounds.npy.
     parser.add_argument("path", default="", help="input path to the video")
     args = parser.parse_args()
 
@@ -255,7 +257,7 @@ if __name__ == '__main__':
     if args.path[-1] != '/':
         args.path += '/'
         
-    # extract images
+    # Extract the first 10 seconds, then overwrite PNGs at half width and height.
     videos = [os.path.join(args.path, vname) for vname in os.listdir(args.path) if vname.endswith(".mp4")]
     images_path = os.path.join(args.path, "images/")
     os.makedirs(images_path, exist_ok=True)

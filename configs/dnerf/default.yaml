@@ -1,6 +1,7 @@
+# YAML values override matching CLI options in main.py.
 gaussian_dim: 4
 time_duration: [0.0, 10.0]
-num_pts: 300_0000
+num_pts: 300_0000  # 3,000,000 initial points when generating a point cloud.
 num_pts_ratio: 1.0
 rot_4d: True
 force_sh_3d: True
@@ -14,7 +15,7 @@ ModelParams:
   # source_path: ".../$dataset"
   # model_path: "output/$dataset"
   images: "images"
-  resolution: 1 # use 2 for the original resolution dataset!
+  resolution: 1 # 1 keeps prepared images; 2 halves width and height again.
   white_background: False
   data_device: "cuda"
   eval: True
@@ -60,19 +61,22 @@ OptimizationParams:
   lambda_rigid: 0.0
   lambda_motion: 0.0
 
+  # Enable gates during training; remove low-mask points during validation.
   use_pruning: True
   use_sh_adaptive: True
-  use_vq: False
+  use_vq: False  # Reserved; no quantization implementation.
 
   lambda_static_mask: 0.0001
   lambda_dynamic_mask: 0.0002
   lambda_sh: 0.0002
 
+  # Training Gaussian threshold; validation uses the separate phi_prune_* values.
   phi_threshold: 0.05
   phi_prune_dynamic: 0.05
   phi_prune_static: 0.05
   phi_prune_sh: 0.05
 
+  # Gates start here; sparsity weights ramp over positive warmup intervals.
   gs_mask_start_iter: 4000
   gs_mask_warmup_iters_static: 1000
   gs_mask_warmup_iters_dynamic: 1000

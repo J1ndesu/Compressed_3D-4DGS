@@ -9,10 +9,11 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+"""PyTorch autograd wrapper; importing this module JIT-compiles the local CUDA rasterizer."""
+
 from typing import NamedTuple
 import torch.nn as nn
 import torch
-# from . import _C
 import os
 from torch.utils.cpp_extension import load
 parent_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diff-gaussian-rasterization")

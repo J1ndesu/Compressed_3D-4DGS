@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+"""Train and evaluate hybrid 3D/4D Gaussians with learned compression masks."""
+
 import os
 import random
 import torch
@@ -41,6 +43,7 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 def save_final_test_images(scene, gaussians, pipe, background, iteration, save_gt=True):
+    """Save clamped predictions and available references under test_images/iter_<iteration>."""
     test_set = scene.getTestCameras()
     if len(test_set) == 0:
         print(f"[ITER {iteration}] No test cameras found, skip saving test images.")
@@ -82,6 +85,12 @@ def save_final_test_images(scene, gaussians, pipe, background, iteration, save_g
 
 def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4d, force_sh_3d,
                num_pts, num_pts_ratio):
+    """Evaluate a checkpoint before and after in-memory hard pruning.
+
+    The test split must be nonempty. Gaussian pruning removes rows; SH pruning
+    zeros independent bands without changing their storage shape. This routine
+    exports images and metrics but does not save a pruned checkpoint.
+    """
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     lpips_fn = lpips.LPIPS(net='alex').cuda().eval()
@@ -98,10 +107,7 @@ def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4
     gaussians.restore(model_params, None)
 
     def _print_rest_param_stats(branch_name, features_rest, sh_mask_logit, threshold):
-        """
-        只统计 features_rest 的参数量（不含 DC）
-        当前只统计前 15 个 spatial SH rest 通道: l1=3, l2=5, l3=7
-        """
+        """Report dense and mask-selected counts for the first 15 non-DC spatial SH channels."""
         if features_rest is None or features_rest.numel() == 0:
             return
         if sh_mask_logit is None or sh_mask_logit.numel() == 0:
@@ -346,7 +352,7 @@ def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4
     print(f"Dynamic kept after pruning    : {size_after_effective['num_dynamic_kept']} / {size_after_effective['num_dynamic_points']}")
     print(f"Static kept after pruning     : {size_after_effective['num_static_kept']} / {size_after_effective['num_static_points']}")
 
-    # ---------------- PSNR Evaluation ----------------
+    # Evaluate PSNR, SSIM, and LPIPS after in-memory pruning.
     print("\nEvaluating pruned model on all test views...")
     all_test_views = list(scene.getTestCameras())
     psnr_pruned_list = []
@@ -379,31 +385,21 @@ def validation(dataset, opt, pipe,checkpoint, gaussian_dim, time_duration, rot_4
     print(f"LPIPS after pruning: {lpips_pruned:.6f}")
     gaussExtractor = GaussianExtractor(gaussians, render, pipe, bg_color=bg_color)   
     
-    #########   1. Validation and Rendering ############
+    # Export pruned renders and aggregate validation metrics.
     print("export rendered testing images ...")
     if len(scene.getTestCameras()) > 0:
         save_final_test_images(scene, gaussians, pipe, background, 6000)
-    # os.makedirs(test_dir, exist_ok=True)
     gaussExtractor.reconstruction(scene.getTestCameras(),test_dir,stage = "validation")
-    # gaussExtractor.export_image(test_dir,mode = "validation")
 
-    # #########    2. Render Trajectory       ############
-    
-    # print("rendering trajectory ...")
-    # traj_dir = os.path.join(test_dir, 'traj')
-    # os.makedirs(traj_dir, exist_ok=True)
-    # n_fames = 480
-    # cam_traj = generate_path(scene.getTrainCameras(), n_frames=n_fames)
-    # gaussExtractor.reconstruction(cam_traj, test_dir,stage = "trajectory")
-    # gaussExtractor.export_image(traj_dir,mode = "trajectory")
-    # create_videos( base_dir =traj_dir,
-    #                input_dir=traj_dir, 
-    #                out_name='render_traj', 
-    #                num_frames=n_fames)
-    
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, debug_from,
              gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size):
     
+    """Train the hybrid representation with scheduled Gaussian and SH gates.
+
+    Mask gates activate at their configured start iteration. Their sparsity
+    penalties then ramp linearly over the respective warmup intervals.
+    """
     if dataset.frame_ratio > 1:
         time_duration = [time_duration[0] / dataset.frame_ratio,  time_duration[1] / dataset.frame_ratio]
     
@@ -482,7 +478,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             iter_start.record()
             gaussians.update_learning_rate(iteration)
             
-            # Every 1000 its we increase the levels of SH up to a maximum degree
+            # Increase the active SH degree at the configured interval, up to its maximum.
             if iteration % opt.sh_increase_interval == 0:
                 gaussians.oneupSHdegree()
             
@@ -536,16 +532,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if gaussians.gaussian_dim == 4:
                     cur_vis = visibility_filter.unsqueeze(1).float()
 
-                    # 1) 当前步 opacity 统计
+                    # Accumulate visible-point opacity; detach statistics from autograd.
                     alpha_stat = gaussians.get_opacity.detach() * cur_vis
 
-                    # 2) 当前步运动强度统计
+                    # Use the conditional mean-offset magnitude as a motion proxy.
                     _, mean_offset = gaussians.get_current_covariance_and_mean_offset(
                         1.0, viewpoint_cam.timestamp
                     )
                     motion_stat = mean_offset.norm(dim=1, keepdim=True).detach() * cur_vis
 
-                    # 3) 当前步时间尺度统计
+                    # Use temporal scale as a support-duration proxy.
                     time_support_stat = gaussians.get_scaling_t.detach() * cur_vis
 
                     batch_alpha_stat.append(alpha_stat)
@@ -560,55 +556,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 Lssim = 1.0 - ssim(image, gt_image)
                 loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * Lssim
                 
-                ###### opa mask Loss ######
+                # Penalize opacity in background-mask regions.
                 if opt.lambda_opa_mask > 0:
                     o = alpha.clamp(1e-6, 1-1e-6)
                     sky = 1 - viewpoint_cam.gt_alpha_mask
 
                     Lopa_mask = (- sky * torch.log(1 - o)).mean()
 
-                    # lambda_opa_mask = opt.lambda_opa_mask * (1 - 0.99 * min(1, iteration/opt.iterations))
                     lambda_opa_mask = opt.lambda_opa_mask
                     loss = loss + lambda_opa_mask * Lopa_mask
-                ###### opa mask Loss ######
                 
-                ###### rigid loss ######
+                # Encourage nearby dynamic points to have similar mean offsets.
                 if opt.lambda_rigid > 0:
                     k = 20
-                    # cur_time = viewpoint_cam.timestamp
-                    # _, delta_mean = gaussians.get_current_covariance_and_mean_offset(1.0, cur_time)
                     xyz_mean = gaussians.get_xyz
-                    xyz_cur =  xyz_mean #  + delta_mean
+                    xyz_cur =  xyz_mean
                     idx, dist = knn(xyz_cur[None].contiguous().detach(), 
                                     xyz_cur[None].contiguous().detach(), 
                                     k)
                     _, velocity = gaussians.get_current_covariance_and_mean_offset(1.0, gaussians.get_t + 0.1)
                     weight = torch.exp(-100 * dist)
-                    # cur_marginal_t = gaussians.get_marginal_t(cur_time).detach().squeeze(-1)
-                    # marginal_weights = cur_marginal_t[idx] * cur_marginal_t[None,:,None]
-                    # weight *= marginal_weights
                     
-                    # mean_t, cov_t = gaussians.get_t, gaussians.get_cov_t(scaling_modifier=1)
-                    # mean_t_nn, cov_t_nn = mean_t[idx], cov_t[idx]
-                    # weight *= torch.exp(-0.5*(mean_t[None, :, None]-mean_t_nn)**2/cov_t[None, :, None]/cov_t_nn*(cov_t[None, :, None]+cov_t_nn)).squeeze(-1).detach()
                     vel_dist = torch.norm(velocity[idx] - velocity[None, :, None], p=2, dim=-1)
                     Lrigid = (weight * vel_dist).sum() / k / xyz_cur.shape[0]
                     loss = loss + opt.lambda_rigid * Lrigid
-                ########################
                 
-                ###### motion loss ######
+                # Penalize dynamic mean-offset magnitude.
                 if opt.lambda_motion > 0:
                     _, velocity = gaussians.get_current_covariance_and_mean_offset(1.0, gaussians.get_t + 0.1)
                     Lmotion = velocity.norm(p=2, dim=1).mean()
                     loss = loss + opt.lambda_motion * Lmotion
-                ########################
 
-                ##########gs_mask###############
+                # Apply separate static and time-weighted dynamic sparsity penalties.
                 if opt.use_pruning and (opt.lambda_static_mask > 0 or opt.lambda_dynamic_mask > 0):
                     if hasattr(gaussians, "static_mask_logit") and gaussians.static_mask_logit.numel() > 0:
                         Lstatic_mask = torch.sigmoid(gaussians.static_mask_logit).mean()
                         if iteration >= gs_mask_start_iter:
-                            # 3500~4500 iter warmup
+                            # Ramp from zero over the configured static-mask warmup interval.
                             warmup = min(1.0, (iteration - gs_mask_start_iter) / gs_mask_warmup_iters_static)
                             current_lambda_static_mask = opt.lambda_static_mask * warmup
 
@@ -620,7 +604,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         st = gaussians.get_scaling_t.detach().view(-1)
                         gate = (st < opt.scale_t_threshold).float()
 
-                        # 时间感知统计量
+                        # Normalize accumulated statistics; vis is a counter ratio, not a calibrated probability.
                         vis = (gaussians.dynamic_vis_denom / (gaussians.denom + 1e-6)).detach().view(-1)
                         motion = (gaussians.dynamic_motion_accum / (gaussians.dynamic_vis_denom + 1e-6)).detach().view(-1)
                         tsup = (gaussians.dynamic_time_support_accum / (gaussians.dynamic_vis_denom + 1e-6)).detach().view(-1)
@@ -629,8 +613,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         motion_norm = motion / (motion.mean() + 1e-6)
                         tsup_norm = tsup / (tsup.mean() + 1e-6)
 
-                        # 时间感知权重：低可见、弱运动、短时支撑 更容易剪
-                        # exp 形式权重：统计量越大，权重越小
+                        # Larger normalized statistics reduce the sparsity penalty exponentially.
+                        # Apply it only to points below the static-conversion scale threshold.
                         beta_vis = 0.5
                         beta_motion = 1.0
                         beta_tsup = 0.25
@@ -646,9 +630,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             warmup = min(1.0, (iteration - gs_mask_start_iter) / gs_mask_warmup_iters_dynamic)
                             current_lambda_dynamic_mask = opt.lambda_dynamic_mask * warmup
                             loss = loss + current_lambda_dynamic_mask * Ldynamic_mask
-                ###################################
 
-                ############SH Loss################
+                # Weight independent SH gates by their band sizes: 3, 5, and 7.
                 if opt.use_sh_adaptive and opt.lambda_sh > 0:
                     sh_weights = torch.tensor([3/15, 5/15, 7/15], device="cuda")
 
@@ -679,7 +662,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if total_num_sh > 0:
                         Lsh = total_weighted_sh / total_num_sh
                         loss = loss + current_lambda_sh * Lsh
-                #######################################
 
                 loss = loss / batch_size
                 loss.backward()
@@ -829,6 +811,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         env_map_optimizer.zero_grad(set_to_none = True)
 
 def prepare_output_and_logger(args):    
+    """Create the output directory, record model arguments, and optionally start TensorBoard."""
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -851,6 +834,7 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_dict=None):
+    """Log training diagnostics and return test PSNR at scheduled evaluation iterations."""
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/ssim_loss', Ll1.item(), iteration)
@@ -930,6 +914,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
 
 def setup_seed(seed):
+     """Seed Python, NumPy, and PyTorch and request deterministic cuDNN behavior."""
      torch.manual_seed(seed)
      torch.cuda.manual_seed_all(seed)
      np.random.seed(seed)
@@ -966,6 +951,7 @@ if __name__ == "__main__":
     cfg = OmegaConf.load(args.config)
 
     def recursive_merge(key, host):
+        """Flatten YAML groups into args, overwriting matching parsed CLI values."""
         if isinstance(host[key], DictConfig):
             for key1 in host[key].keys():
                 recursive_merge(key1, host[key])

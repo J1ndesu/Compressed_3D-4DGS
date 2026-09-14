@@ -1,11 +1,10 @@
+"""Straight-through gates for Gaussian and spatial spherical harmonic pruning."""
+
 import torch
 from torch import nn
 
 class STEFunction(torch.autograd.Function):
-    """
-    直通估计器 (Straight-Through Estimator)
-    前向传播进行硬二值化，反向传播跳过二值化直接传梯度
-    """
+    """Binarize with a strict threshold and pass input gradients through unchanged."""
     @staticmethod
     def forward(ctx, input_mask, threshold=0.5):
         return (input_mask > threshold).float()
@@ -15,16 +14,30 @@ class STEFunction(torch.autograd.Function):
         return grad_output, None
 
 def get_ste_mask(mask_logit, threshold=0.1):
-    """
-    计算高斯剪枝掩码
+    """Return binary Gaussian gates with sigmoid surrogate gradients.
+
+    Args:
+        mask_logit: Floating-point logits, normally shaped (N, 1).
+        threshold: Keep entries whose sigmoid value is strictly greater.
+
+    Returns:
+        A tensor with the input shape: binary in the forward pass, with
+        gradients through sigmoid(mask_logit) in the backward pass.
     """
     soft_mask = torch.sigmoid(mask_logit)
     hard_mask = STEFunction.apply(soft_mask, threshold)
     return soft_mask + (hard_mask - soft_mask).detach()
 
 def get_sh_masks(sh_logits, threshold=0.1):
-    """
-    计算 SH 自适应剪枝掩码
+    """Return independent straight-through gates for spatial SH bands 1, 2, 3.
+
+    Args:
+        sh_logits: Per-Gaussian band logits of shape (N, 3).
+        threshold: Keep bands whose sigmoid value is strictly greater.
+
+    Returns:
+        Binary forward gates of shape (N, 3), with sigmoid surrogate gradients.
+        Keeping a higher band does not require keeping any lower band.
     """
     soft_sh = torch.sigmoid(sh_logits)                      # [N, 3]
     hard_sh = STEFunction.apply(soft_sh, threshold)         # [N, 3]
@@ -32,14 +45,16 @@ def get_sh_masks(sh_logits, threshold=0.1):
     return soft_sh + (hard_sh - soft_sh).detach()
 
 def apply_sh_masks(shs, masks):
-    """
-    独立掩码应用到SH:
-    DC 不动
-    l=1 -> 1:4
-    l=2 -> 4:9
-    l=3 -> 9:16
+    """Gate spatial SH bands while preserving DC, extra channels, and tensor shape.
 
-    如果后面还有额外通道，保留 tail，不要截断。
+    Args:
+        shs: Coefficients of shape (N, C, 3), with C >= 16 and DC at index 0.
+        masks: Gates of shape (N, 3), one for each spatial band.
+
+    Returns:
+        Coefficients of shape (N, C, 3). Bands 1, 2, and 3 occupy slices
+        1:4, 4:9, and 9:16. Channels from index 16 onward pass through.
+        Zeroed bands remain allocated; this function does not pack a bitstream.
     """
     assert shs.shape[1] >= 16, f"Expected >=16 SH channels, got {shs.shape[1]}"
 

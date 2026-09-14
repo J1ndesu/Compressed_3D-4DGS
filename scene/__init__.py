@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+"""Scene loading, camera datasets, and model checkpoint output."""
+
 import os
 import torch
 import random
@@ -27,8 +29,10 @@ class Scene:
     gaussians : GaussianModel
 
     def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], num_pts=100_000, num_pts_ratio=1.0, time_duration=None):
-        """b
-        :param path: Path to colmap scene main folder.
+        """Load cameras and initialize Gaussians from the detected scene format.
+
+        args.source_path must contain sparse/ or transforms_train.json.
+        The caller must create args.model_path before scene metadata is written.
         """
         self.model_path = args.model_path
         self.loaded_iter = None
@@ -45,7 +49,6 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
-        # import pdb; pdb.set_trace()
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             colmap=True
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.white_background, args.eval, num_pts=num_pts, time_duration=time_duration, extension=args.extension, num_extra_pts=args.num_extra_pts, frame_ratio=args.frame_ratio, dataloader=args.dataloader, args=args)
@@ -97,6 +100,7 @@ class Scene:
                 self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
     def save(self, iteration):
+        """Save a full training checkpoint and a spatial-only PLY of the dynamic pool."""
         torch.save((self.gaussians.capture(), iteration), self.model_path + "/chkpnt" + str(iteration) + ".pth")
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))

@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+"""Argument groups and defaults; main.py subsequently applies YAML overrides."""
+
 from argparse import ArgumentParser, Namespace
 import sys
 import os
@@ -17,6 +19,11 @@ class GroupParams:
     pass
 
 class ParamGroup:
+    """Register subclass defaults as CLI options and extract a matching namespace.
+
+    A leading underscore adds a one-letter alias. Boolean options use
+    store_true; set them to false in YAML when the configuration enables them.
+    """
     def __init__(self, parser: ArgumentParser, name : str, fill_none = False):
         group = parser.add_argument_group(name)
         for key, value in vars(self).items():
@@ -82,6 +89,7 @@ class PipelineParams(ParamGroup):
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
+    """Defaults for reconstruction, densification, and compression training."""
     def __init__(self, parser):
         self.iterations = 30_000
         self.position_lr_init = 0.00016
@@ -110,18 +118,18 @@ class OptimizationParams(ParamGroup):
         self.lambda_motion = 0.0
         self.scale_t_threshold =3.0
 
-        #新增超参数
-        self.use_pruning = False            # 是否开启高斯剪枝开关
-        self.use_sh_adaptive = False        # 是否开启SH自适应剪枝
-        self.use_vq = False                 # 是否开启矢量量化
+        # Compression flags, penalties, and thresholds.
+        self.use_pruning = False  # Enable learned Gaussian opacity gates.
+        self.use_sh_adaptive = False  # Enable independent spatial SH band gates.
+        self.use_vq = False  # Reserved flag; no vector-quantization pipeline is implemented.
         
-        self.lambda_static_mask = 0.0002     # 权重 λ_GSprune_static
-        self.lambda_dynamic_mask = 0.0005    # 权重 λ_GSprune_dynamic
-        self.lambda_sh = 0.0005              # 权重 λ_SHprune
-        self.phi_threshold = 0.1             # STE 二值化阈值 φ_thres
-        self.phi_prune_dynamic = 0.1        # 动态剪枝的阈值 φ_prune_dynamic
-        self.phi_prune_static = 0.1         # 静态剪枝的阈值 φ_prune_static
-        self.phi_prune_sh = 0.1             # SH 剪枝的阈值 φ_prune_SH
+        self.lambda_static_mask = 0.0002  # Static Gaussian sparsity weight.
+        self.lambda_dynamic_mask = 0.0005  # Time-weighted dynamic Gaussian sparsity weight.
+        self.lambda_sh = 0.0005  # SH band sparsity weight.
+        self.phi_threshold = 0.1  # Strict sigmoid threshold for training-time Gaussian gates.
+        self.phi_prune_dynamic = 0.1  # Hard-pruning threshold for dynamic points in validation.
+        self.phi_prune_static = 0.1  # Hard-pruning threshold for static points in validation.
+        self.phi_prune_sh = 0.1  # SH band threshold for rendering and validation hard pruning.
         
         self.gs_mask_start_iter = 3500
         self.gs_mask_warmup_iters_static = 1000
@@ -130,19 +138,23 @@ class OptimizationParams(ParamGroup):
         self.sh_mask_start_iter = 4000
         self.sh_mask_warmup_iters = 1000
         
-        # 针对 ECVQ 的超参数
-        self.lambda_vqr = 0.0               # 旋转量化的率失真权重 λ(r)
-        self.lambda_vqs = 0.0               # 缩放量化的率失真权重 λ(s)
-        self.lambda_vqc = 0.0               # 颜色量化的率失真权重 λ(c)
+        # Reserved vector-quantization parameters.
+        self.lambda_vqr = 0.0  # Reserved rotation VQ weight; keep zero.
+        self.lambda_vqs = 0.0  # Reserved scale VQ weight; keep zero.
+        self.lambda_vqc = 0.0  # Reserved color VQ weight; keep zero.
 
-        self.static_mask_lr = 0.002         # 静态掩码 Logits 的学习率
-        self.dynamic_mask_lr = 0.005        # 动态掩码 Logits 的学习率
-        self.sh_mask_lr = 0.05              # SH 掩码 Logits 的学习率
-        self.codebook_lr = 0.0              # VQ 码本的学习率
+        self.static_mask_lr = 0.002  # Learning rate for static Gaussian mask logits.
+        self.dynamic_mask_lr = 0.005  # Learning rate for dynamic Gaussian mask logits.
+        self.sh_mask_lr = 0.05  # Learning rate for SH mask logits.
+        self.codebook_lr = 0.0  # Reserved VQ codebook learning rate; keep zero.
 
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
+    """Merge saved cfg_args with non-None CLI values.
+
+    This legacy helper is not the YAML merge used by main.py.
+    """
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
     args_cmdline = parser.parse_args(cmdlne_string)

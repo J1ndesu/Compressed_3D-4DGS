@@ -2,9 +2,12 @@
 
 set -euo pipefail
 
+# Run from the repository root; edit dataset roots, scenes, and GPU below.
 device=0
+# Must match a checkpoint actually saved by training.
 ckpt_name="chkpnt6000.pth"
 
+# These are local example paths and must match your machine.
 n3v_root="/root/autodl-tmp/data/N3V"
 dnerf_root="/root/autodl-tmp/data/dnerf"
 
@@ -76,5 +79,6 @@ run_val_group () {
     done
 }
 
+# N3V execution is disabled below; uncomment this call to evaluate N3V scenes.
 #run_val_group "N3V"   "${n3v_root}"   "${n3v_config}"   "${n3v_scenes[@]}"
 run_val_group "DNeRF" "${dnerf_root}" "${dnerf_config}" "${dnerf_scenes[@]}"

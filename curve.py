@@ -1,3 +1,5 @@
+"""Plot manually recorded rate-distortion data; no training logs are read automatically."""
+
 import matplotlib.pyplot as plt
 import numpy as np
 import os
@@ -40,6 +42,7 @@ metric_info = {
 }
 
 def check_data_validity(experiments):
+    """Require equal array lengths within each method before plotting."""
     for exp_name, methods in experiments.items():
         for method_name, data in methods.items():
             lengths = {k: len(v) for k, v in data.items()}
@@ -49,6 +52,11 @@ def check_data_validity(experiments):
                 )
 
 def plot_rd_for_experiment(exp_name, methods, metric_name, save_dir="figures", use_log_x=True):
+    """Plot one metric from the manually entered experiment table and save a PNG.
+
+    Rates <= 0.01 are omitted. The SH-only plot always uses a linear rate axis;
+    other experiments use a log axis when use_log_x is True.
+    """
     os.makedirs(save_dir, exist_ok=True)
 
     plt.figure(figsize=(6, 5))
@@ -110,51 +118,6 @@ def plot_rd_for_experiment(exp_name, methods, metric_name, save_dir="figures", u
     print(f"Saved: {filename}")
 
 
-# def plot_cross_experiment(metric_name, experiments, save_dir="figures", use_log_x=True):
-#     os.makedirs(save_dir, exist_ok=True)
-
-#     plt.figure(figsize=(6, 5))
-#     curve_id = 0
-
-#     for exp_name, methods in experiments.items():
-#         for method_name, data in methods.items():
-#             rate = data["rate"]
-#             metric = data[metric_name]
-
-#             idx = np.argsort(rate)
-#             rate = rate[idx]
-#             metric = metric[idx]
-
-#             mask = rate > 0.05
-#             rate = rate[mask]
-#             metric = metric[mask]
-
-#             plt.plot(
-#                 rate,
-#                 metric,
-#                 marker=markers[curve_id % len(markers)],
-#                 linestyle=linestyles[curve_id % len(linestyles)],
-#                 linewidth=2,
-#                 markersize=6,
-#                 label=f"{exp_name}-{method_name}"
-#             )
-#             curve_id += 1
-
-#     if use_log_x:
-#         plt.xscale('log')
-
-#     plt.xlabel('Rate')
-#     plt.ylabel(metric_info[metric_name]["ylabel"])
-#     plt.title(f'Cross-Experiment RD Curve ({metric_info[metric_name]["ylabel"]})')
-#     plt.legend(fontsize=9)
-#     plt.grid(True, linestyle='--', alpha=0.6)
-#     plt.tight_layout()
-
-#     filename = os.path.join(save_dir, f'cross_{metric_name}.png')
-#     plt.savefig(filename, dpi=300, bbox_inches='tight')
-#     plt.close()
-#     print(f"Saved: {filename}")
-
 if __name__ == "__main__":
     check_data_validity(experiments)
 
@@ -162,7 +125,5 @@ if __name__ == "__main__":
         for metric_name in ["psnr", "ssim", "lpips"]:
             plot_rd_for_experiment(exp_name, methods, metric_name, save_dir="figures")
 
-    # for metric_name in ["psnr", "ssim", "lpips"]:
-    #     plot_cross_experiment(metric_name, experiments, save_dir="figures")
 
     print("All figures are saved in ./figures/")
